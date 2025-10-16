@@ -1,0 +1,614 @@
+---
+title: "ATTEMPT Cell Chat"
+author: "Ye Ji Choi"
+date: "`r lubridate::today()`"
+format: 
+  html:
+    toc: true
+    toc-depth: 5
+    toc-location: left
+    code-fold: true
+    embed-resources: true
+---
+
+```{r libraries, message = F, warning=F}
+#| include: false
+source("/mmfs1/gscratch/togo/yejichoi/CHCO-Code/Petter Bjornstad/ATTEMPT/attempt_functions.R")
+library(future)
+library(future.apply)
+library(tidyverse)
+library(colorspace)
+library(patchwork)
+library(ggdendro)
+library(cowplot)
+library(ggpubr)
+library(rstatix)
+library(arsenal)
+library(Biobase)
+library(msigdbr)
+library(kableExtra)
+# library(knitr)
+library(REDCapR)
+# library(data.table)
+library(emmeans)
+library(NMF)
+library(pheatmap)
+library(UpSetR)
+library(enrichR)
+library(WriteXLS)
+library(SAVER)
+library(readxl)
+library(limma)
+library(edgeR)
+library(BiocGenerics)
+library(GSEABase)
+library(slingshot)
+library(SingleCellExperiment)
+library(MAST)
+library(muscat)
+library(scater)
+library(Seurat)
+library(jsonlite)
+library(dplyr)
+library(glmmTMB)
+library(reshape2)
+library(broom.mixed) 
+library(foreach)
+library(doParallel)
+library(nebula)
+library(Matrix)
+library(scran)
+library(DirichletReg)
+library(BiocParallel)
+library(CellChat)
+library(liana)
+library(magrittr)
+library(circlize)
+library(slingshot)
+library(uwot)
+library(mclust, quietly = TRUE)
+library(condiments)
+library(plotly)
+library(grDevices)
+library(lme4)
+library(lmerTest)
+library(emmeans)
+library(htmlwidgets)
+library(mixtools)
+library(quantreg)
+```
+
+```{r include = F}
+reticulate::use_python("/mmfs1/gscratch/togo/yejichoi/mypy/bin/python", required = T)
+reticulate::repl_python()
+reticulate::py_config()
+# set up Kopah connection
+## Load boto3 and pandas
+boto3 <- reticulate::import("boto3")
+pd <- reticulate::import("pandas")
+
+## Create an S3 client
+keys <- fromJSON("/mmfs1/home/yejichoi/keys.json")
+session <- boto3$session$Session(
+  aws_access_key_id = keys$MY_ACCESS_KEY,
+  aws_secret_access_key = keys$MY_SECRET_KEY
+)
+
+## Create an S3 client with the session
+s3 <- session$client("s3", endpoint_url = "https://s3.kopah.uw.edu")
+
+```
+
+```{r echo = F, eval = T}
+# Read in clean seurat object saved from attempt_CROC_analysis.qmd
+temp_file <- tempfile(fileext = ".rds")
+s3$download_file("attempt", 'cleaned_data/attempt_clean_so.rds', temp_file)
+attempt_so <- readRDS(temp_file)
+``` 
+
+```{r echo = F}
+# clustering cells
+# cl1 <- Mclust(rd1)$classification
+# colData(sce_pt)$GMM <- cl1
+# 
+# library(RColorBrewer)
+# plot(rd1, col = brewer.pal(9,"Set1")[cl1], pch=16, asp = 1)
+# 
+# cl2 <- kmeans(rd1, centers = 4)$cluster
+# colData(sce_pt)$kmeans <- cl2
+# 
+# plot(rd1, col = brewer.pal(9,"Set1")[cl2], pch=16, asp = 1)
+# 
+# sce_pt_gmm <- slingshot(sce_pt, clusterLabels = 'GMM', reducedDim = 'PCA')
+```
+
+# PT (KPMP celltype)
+
+```{r echo = F}
+pt_kpmp_results <- analyze_pseudotime_by_celltype(
+  so = attempt_so,
+  celltype_col = "KPMP_celltype",
+  celltype_groups = c("aPT", "PT-S1/S2", "PT-S3"),
+  start_cluster = "PT-S1/S2",
+  custom_colors = color_5,
+  suffix = "pt_kpmp",
+  aws_s3 = s3,
+  tau = c(0.25, 0.65, 0.85)
+)
+# 
+# pt_kpmp_results$pseudotime_df
+# pt_kpmp_results$sce_df$hba1c_delta
+# 
+# pt_kpmp_results$sce_df$hba1c_delta_dir <- ifelse(pt_kpmp_results$sce_df$hba1c_delta < 0, "neg", "pos")
+# wilcox.test(slingPseudotime_1 ~ hba1c_delta_dir, data = pt_kpmp_results$sce_df)
+# tapply(pt_kpmp_results$sce_df$slingPseudotime_1,
+#        pt_kpmp_results$sce_df$hba1c_delta_dir,
+#        median, na.rm = TRUE)
+pt_kpmp_results$clin_var_res$hba1c_delta$df_binned %>%
+  filter(abs(hba1c_delta) > 0.3) %>%
+  filter(!is.na(clinical_bin)) %>%
+  group_by(subject_id, visit) %>%
+  mutate(weights = 1/n()) %>% ungroup() %>%
+  ggplot(aes(x = slingPseudotime_1, fill = visit)) +
+  geom_density(alpha = 0.5, aes(weight = weights)) +
+  facet_wrap(~clinical_bin, ncol = 1) +
+  scale_fill_manual(values = c("POST" = "#f28482", "PRE" = "#457b9d", "No Change" = "#888888")) +
+  theme(panel.background = element_blank())
+
+pt_kpmp_results$clin_var_res$tir_delta$df_binned %>%
+  filter(abs(tir_delta) > 0.5) %>%
+  filter(!is.na(clinical_bin)) %>%
+  group_by(subject_id, visit) %>%
+  mutate(weights = 1/n()) %>% ungroup() %>%
+  ggplot(aes(x = slingPseudotime_1, fill = visit)) +
+  geom_density(alpha = 0.5, aes(weight = weights)) +
+  facet_wrap(~clinical_bin, ncol = 1) +
+  scale_fill_manual(values = c("POST" = "#f28482", "PRE" = "#457b9d", "No Change" = "#888888")) +
+  theme(panel.background = element_blank())
+
+pt_kpmp_results$clin_var_res$mgfr_jodal_bsa$df_binned %>%
+  filter(abs(mgfr_jodal_bsa) > 3) %>%
+  filter(!is.na(clinical_bin)) %>%
+  ggplot(aes(x = slingPseudotime_1, fill = visit)) +
+  geom_density(alpha = 0.5) +
+  facet_wrap(~clinical_bin, ncol = 1) +
+  scale_fill_manual(values = c("POST" = "#f28482", "PRE" = "#457b9d", "No Change" = "#888888")) +
+  theme(panel.background = element_blank())
+
+pt_kpmp_results$clin_var_res$mgfr_jodal_bsa$df_binned %>%
+  # filter(abs(mgfr_jodal_bsa) > 3) %>%
+  filter(!is.na(clinical_bin)) %>%
+  group_by(subject_id, visit) %>%
+  mutate(weights = 1/n()) %>% ungroup() %>%
+  ggplot(aes(x = slingPseudotime_1, fill = visit)) +
+  geom_density(alpha = 0.5, aes(weight = weights)) +
+  facet_wrap(~clinical_bin, ncol = 1) +
+  scale_fill_manual(values = c("POST" = "#f28482", "PRE" = "#457b9d", "No Change" = "#888888")) +
+  theme(panel.background = element_blank())
+
+
+dat <- pt_kpmp_results$sce_df 
+summary(lmer(slingPseudotime_1 ~ hba1c + (1|subject_id), data = dat))
+summary(lmer(slingPseudotime_1 ~ weight + (1|subject_id), data = dat))
+summary(lmer(slingPseudotime_1 ~ bmi + (1|subject_id), data = dat))
+summary(lmer(slingPseudotime_1 ~ mgfr_jodal_bsa + (1|subject_id), data = dat))
+summary(lmer(slingPseudotime_1 ~ cgm_tir + (1|subject_id), data = dat))
+
+# qqnorm(resid(m)); qqline(resid(m))
+# hist(resid(m), breaks = 50)
+# plot(fitted(m), resid(m))
+# ranef(m)$subject_id %>% as.data.frame() %>% ggplot(aes(`(Intercept)`)) + geom_histogram()
+# summary(m)
+
+# normalize by subject
+dat <- dat %>%
+  group_by(subject_id, visit) %>%
+  mutate(weights = 1/n()) %>%
+  ungroup()
+
+ggplot(dat, aes(x = slingPseudotime_1, fill= treatment)) +
+  geom_density(aes(weight = weights), alpha = 0.7) +
+  theme_minimal()
+
+
+pt_kpmp_results$p_pseudotime
+
+```
+
+```{r}
+calc_density_diff <- function(df, direction_val,
+                              direction_var = "direction",
+                              use_weights = TRUE,
+                              n_grid = 512,
+                              bw_method = c("SJ", "nrd0", "ucv"),
+                              bw_mult = 1) {
+
+  bw_method <- match.arg(bw_method)
+
+  # subset PRE/POST for this direction
+  pre_df  <- df %>% dplyr::filter(visit == "PRE",  !!rlang::sym(direction_var) == direction_val)
+  post_df <- df %>% dplyr::filter(visit == "POST", !!rlang::sym(direction_var) == direction_val)
+
+  pre_vals  <- pre_df$slingPseudotime_1
+  post_vals <- post_df$slingPseudotime_1
+
+  # bring along weights (optional)
+  if (use_weights && "weight_per_cell" %in% names(df)) {
+    pre_w  <- pre_df$weight_per_cell
+    post_w <- post_df$weight_per_cell
+  } else {
+    pre_w  <- rep(1, length(pre_vals))
+    post_w <- rep(1, length(post_vals))
+  }
+
+  # drop NAs in a paired way
+  keep_pre  <- !(is.na(pre_vals)  | is.na(pre_w))
+  keep_post <- !(is.na(post_vals) | is.na(post_w))
+  pre_vals  <- pre_vals[keep_pre]
+  pre_w     <- pre_w[keep_pre]
+  post_vals <- post_vals[keep_post]
+  post_w    <- post_w[keep_post]
+
+  # normalize weights to sum to 1 (what density() expects)
+  pre_w  <- pre_w  / sum(pre_w)
+  post_w <- post_w / sum(post_w)
+
+  # choose a common grid and bandwidth
+  xr <- range(c(pre_vals, post_vals))
+  common_x <- seq(xr[1], xr[2], length.out = n_grid)
+
+  # bandwidth (numeric), chosen on the pooled values (unweighted)
+  bw_num <- switch(bw_method,
+                   SJ   = stats::bw.SJ(c(pre_vals, post_vals)) * bw_mult,
+                   nrd0 = stats::bw.nrd0(c(pre_vals, post_vals)) * bw_mult,
+                   ucv  = stats::bw.ucv(c(pre_vals, post_vals)) * bw_mult)
+
+  # guardrails: density() needs >= 2 unique points; fallback if needed
+  kde_safe <- function(x, w) {
+    x <- x[!is.na(x)]
+    w <- w[!is.na(x)]  # synced after previous step
+    if (length(unique(x)) >= 2) {
+      d <- stats::density(x, weights = w, bw = bw_num, from = xr[1], to = xr[2], n = n_grid)
+      approx(d$x, d$y, common_x)$y
+    } else if (length(x) >= 1) {
+      # singleton/constant fallback: narrow Gaussian bump
+      mu <- mean(x)
+      sd0 <- (diff(xr) + 1e-9) * 0.05
+      y <- dnorm(common_x, mean = mu, sd = sd0)
+      y / sum(y)  # just to scale sensibly
+    } else {
+      rep(0, length(common_x))
+    }
+  }
+
+  y_pre  <- kde_safe(pre_vals,  pre_w)
+  y_post <- kde_safe(post_vals, post_w)
+
+  data.frame(x = common_x,
+             y = y_post - y_pre,
+             group = direction_val,
+             stringsAsFactors = FALSE)
+}
+
+plot_density_diff <- function(data, var_name, delta_symbol,
+                              direction_var = "direction",
+                              direction_vals = c("-", "+"),
+                              color_vals = c("-" = "#457b9d", "+" = "#f28482"),
+                              color_label = NULL,
+                              use_weights = TRUE,
+                              n_grid = 512,
+                              bw_method = "SJ",
+                              bw_mult = 1) {
+
+  if (is.null(color_label)) color_label <- paste0("\u0394", var_name, " Direction")
+
+  # caption counts by direction (unique subjects)
+  df_dist <- data %>% dplyr::distinct(subject_id, .keep_all = TRUE)
+  if (direction_var == "direction") {
+    tab <- table(df_dist$direction)
+    cap <- paste0("N of \u0394", var_name, " -: ", as.integer(tab["-"]), "\n",
+                  "N of \u0394", var_name, " +: ", as.integer(tab["+"]))
+  } else {
+    tab <- table(df_dist[[direction_var]])
+    cap <- paste(paste0("N of ", names(tab), ": ", as.integer(tab)), collapse = "\n")
+  }
+
+  plot_df <- do.call(rbind, lapply(direction_vals, function(val)
+    calc_density_diff(data, val, direction_var, use_weights, n_grid, bw_method, bw_mult)
+  ))
+
+  ggplot(plot_df, aes(x = x, y = y, color = group)) +
+    geom_line(linewidth = 1.2) +
+    geom_hline(yintercept = 0, linetype = "dashed") +
+    scale_color_manual(values = color_vals) +
+    labs(x = "Pseudotime",
+         y = "Density Difference (Post − Pre)",
+         color = color_label,
+         caption = cap) +
+    theme_minimal() +
+    theme(panel.grid = element_blank(),
+          plot.caption = element_text(hjust = 0.5, size = 10))
+}
+
+
+# Now create all your plots simply:
+p1 <- plot_density_diff(pt_kpmp_results$clin_var_res$hba1c_delta$df_binned, 
+                        "HbA1c", "\u0394HbA1c")
+
+p2 <- plot_density_diff(pt_kpmp_results$clin_var_res$tir_delta$df_binned, 
+                        "TIR", "\u0394TIR")
+
+p3 <- plot_density_diff(pt_kpmp_results$clin_var_res$mgfr_jodal_bsa_delta$df_binned, 
+                        "mGFR", "\u0394mGFR")
+
+p4 <- plot_density_diff(pt_kpmp_results$clin_var_res$weight_delta$df_binned, 
+                        "Weight", "\u0394Weight")
+
+p5 <- plot_density_diff(pt_kpmp_results$clin_var_res$weight_delta$df_binned, 
+                        "Weight", "\u0394Weight",
+                        direction_var = "treatment",
+                        direction_vals = c("Placebo", "Dapagliflozin"),
+                        color_vals = c("Placebo" = "#f4978e", "Dapagliflozin" = "#828e82"),
+                        color_label = "Treatment")
+
+(p1 + p2) / (p3 + p4)
+p5
+
+temp_file <- tempfile(fileext = ".png")
+ggsave(filename = temp_file, plot = p1, width = 7, height = 5)
+s3$upload_file(temp_file, "attempt", paste0("slingshot/attempt_density_diff_hba1c_slingshot.png"))
+
+temp_file <- tempfile(fileext = ".png")
+ggsave(filename = temp_file, plot = p2, width = 7, height = 5)
+s3$upload_file(temp_file, "attempt", paste0("slingshot/attempt_density_diff_tir_slingshot.png"))
+
+temp_file <- tempfile(fileext = ".png")
+ggsave(filename = temp_file, plot = p3, width = 7, height = 5)
+s3$upload_file(temp_file, "attempt", paste0("slingshot/attempt_density_diff_mgfr_slingshot.png"))
+
+temp_file <- tempfile(fileext = ".png")
+ggsave(filename = temp_file, plot = p4, width = 7, height = 5)
+s3$upload_file(temp_file, "attempt", paste0("slingshot/attempt_density_diff_weight_slingshot.png"))
+
+temp_file <- tempfile(fileext = ".png")
+ggsave(filename = temp_file, plot = p5, width = 7, height = 5)
+s3$upload_file(temp_file, "attempt", paste0("slingshot/attempt_density_diff_trt_slingshot.png"))
+```
+
+```{r echo = F}
+# compositional pie charts of cell groups
+bins <- c(0, 10, 20, 30, 40)
+color_palette <- c(
+  "aPT" = "#264653",
+  "PT-S1/S2" = "#2a9d8f",
+  "PT-S3" = "#e9c46a"
+)
+
+visit_treatment_color_palette <- c(
+  "PRE Placebo" = "#fbc4ab",
+  "POST Placebo" = "#f4978e",
+  "PRE Dapagliflozin" = "#ccd5ae",
+  "POST Dapagliflozin" = "#828e82"
+)
+
+# pseudotime 0 - 50 (every 10)
+proportions_df <- calculate_celltype_proportions(pt_kpmp_results$sce_df, bin_width = 10) %>%
+  group_by(bin_start) %>%
+  mutate(ypos = cumsum(proportion)- 0.5*proportion) %>%
+  ungroup()
+
+slingshot_main_pies <- lapply(bins, function(bin) {
+  create_pie_chart(proportions_df, bin, color_palette)
+})
+names(slingshot_main_pies) <- paste0("p", 1:5)
+
+ggarrange(pt_kpmp_results$p_pseudotime$plot, 
+          ggarrange(slingshot_main_pies$p1, slingshot_main_pies$p2, slingshot_main_pies$p3, slingshot_main_pies$p4, slingshot_main_pies$p5, nrow = 1,
+                    common.legend = T, legend = "bottom"),
+          nrow = 2, align = "v", heights = c(4,1))
+
+temp_file <- tempfile(fileext = ".png")
+ggsave(filename = temp_file, width = 12, height = 10)
+s3$upload_file(temp_file, "attempt", file.path("slingshot", paste0("attempt_pt_slingshot_density_celltype_pie.png")))
+
+
+# compositional pie charts of treatment groups
+group_by_col    <- "visit_treatment"
+caption_groups  <- c("PRE Placebo", "POST Placebo", "PRE Dapagliflozin", "POST Dapagliflozin")
+palette_used    <- visit_treatment_color_palette  # named vector
+n_pies_to_show  <- 5                              # how many bins/mini pies per row
+out_dir_key     <- "slingshot"                    # S3 folder key
+
+# Helper to sanitize names for filenames
+sanitize_name <- function(x) gsub("[^A-Za-z0-9_\\-]+", "_", x)
+
+# Build the pie row for one clin var result
+build_pie_row <- function(df, group_by = group_by_col, n_pies = n_pies_to_show) {
+  props <- calculate_celltype_proportions(df, bin_width = 10, group_by = group_by) %>%
+    dplyr::group_by(bin_start) %>%
+    dplyr::mutate(ypos = cumsum(proportion) - 0.5 * proportion) %>%
+    dplyr::ungroup()
+
+  # Pick bins to show: first N (or all if fewer)
+  bins <- sort(unique(props$bin_start))
+  if (length(bins) == 0) stop("No bins available to plot.")
+  bins <- bins[seq_len(min(length(bins), n_pies))]
+
+  pies <- lapply(bins, function(bin_val) {
+    create_pie_chart(
+      data            = props,
+      bin_value       = bin_val,
+      color_palette   = palette_used,
+      group_by        = group_by,
+      caption_groups  = caption_groups
+    )
+  })
+
+  # Name them p1..pK for ggpubr::ggarrange convenience
+  names(pies) <- paste0("p", seq_along(pies))
+  pies
+}
+
+# Main loop over all clinical variables you’ve analyzed
+all_outputs <- list()
+
+for (clin_var in names(pt_kpmp_results$clin_var_res)) {
+  message(sprintf("[%s] Rendering panels for %s...", format(Sys.time(), "%Y-%m-%d %H:%M:%S"), clin_var))
+
+  res_obj <- pt_kpmp_results$clin_var_res[[clin_var]]
+  df      <- res_obj$df
+  mainplt <- res_obj$plot
+
+  # Build the pies row (may be fewer than n_pies_to_show if data has fewer bins)
+  pies <- build_pie_row(df, group_by = group_by_col, n_pies = n_pies_to_show)
+
+  # Combine: main plot on top, pies in a single row below (shared legend at bottom)
+  pies_row <- do.call(
+    ggpubr::ggarrange,
+    c(pies, list(nrow = 1, common.legend = TRUE, legend = "bottom"))
+  )
+
+  combo <- ggpubr::ggarrange(mainplt, pies_row, nrow = 2, align = "v", heights = c(4, 1))
+
+  # Save and upload
+  tmpfile <- tempfile(fileext = ".png")
+  ggplot2::ggsave(filename = tmpfile, plot = combo, width = 12, height = 10, dpi = 300)
+
+  key_name <- file.path(out_dir_key, paste0("attempt_pt_slingshot_density_", sanitize_name(clin_var), "_pie.png"))
+  s3$upload_file(tmpfile, "attempt", key_name)
+
+  all_outputs[[clin_var]] <- list(plot = combo, s3_key = key_name)
+}
+
+pt_kpmp_results$clin_var_res$hba1c_delta$plot_visit_direction
+```
+
+
+# PT (non-KPMP celltype)
+
+```{r echo = F}
+pt_results <- analyze_pseudotime_by_celltype(
+  so = attempt_so,
+  celltype_col = "celltype",
+  celltype_groups = c("PT-1", "PT-2", "PT-3", "PT-4", "PT-5"),
+  start_cluster = "PT-2",
+  custom_colors = color_5,
+  suffix = "pt",
+  aws_s3 = s3,
+  tau = c(0.25, 0.65, 0.85)
+)
+```
+
+# TAL (KPMP celltype)
+
+```{r echo = F}
+tal_kpmp_results <- analyze_pseudotime_by_celltype(
+  so = attempt_so,
+  celltype_col = "KPMP_celltype",
+  celltype_groups = c("aTAL", "C-TAL-1", "C-TAL-2", "dTAL"),
+  start_cluster = "aTAL",
+  custom_colors = color_5,
+  suffix = "tal_kpmp",
+  aws_s3 = s3
+)
+```
+
+# TAL + ATL (KPMP celltype)
+
+```{r echo = F}
+tal_atl_kpmp_results <- analyze_pseudotime_by_celltype(
+  so = attempt_so,
+  celltype_col = "KPMP_celltype",
+  celltype_groups = c("aTAL", "C-TAL-1", "C-TAL-2", "dTAL", "ATL"),
+  start_cluster = "aTAL",
+  custom_colors = color_5,
+  suffix = "tal_atl_kpmp",
+  aws_s3 = s3
+)
+```
+
+# TAL (non-KPMP celltype)
+
+```{r echo = F}
+tal_results <- analyze_pseudotime_by_celltype(
+  so = attempt_so,
+  celltype_col = "celltype",
+  celltype_groups = c("TAL-1", "TAL-2", "TAL-3"),
+  start_cluster = "TAL-2",
+  custom_colors = color_5,
+  suffix = "tal",
+  aws_s3 = s3
+)
+```
+
+# TAL + ATL (non-KPMP celltype)
+
+```{r echo = F}
+tal_atl_results <- analyze_pseudotime_by_celltype(
+  so = attempt_so,
+  celltype_col = "celltype",
+  celltype_groups = c("TAL-1", "TAL-2", "TAL-3", "ATL"),
+  start_cluster = "TAL-2",
+  custom_colors = color_5,
+  suffix = "tal_atl",
+  aws_s3 = s3
+)
+```
+
+
+
+# IC (KPMP celltype)
+
+```{r echo = F}
+ic_kpmp_results <- analyze_pseudotime_by_celltype(
+  so = attempt_so,
+  celltype_col = "KPMP_celltype",
+  celltype_groups = c("IC-A", "IC-B", "aIC"),
+  start_cluster = "IC-A",
+  custom_colors = color_5,
+  suffix = "ic_kpmp",
+  aws_s3 = s3
+)
+```
+
+# IC (non-KPMP celltype)
+
+```{r echo = F}
+ic_results <- analyze_pseudotime_by_celltype(
+  so = attempt_so,
+  celltype_col = "celltype",
+  celltype_groups = c("IC-A", "IC-B"),
+  start_cluster = "IC-A",
+  custom_colors = color_5,
+  suffix = "ic",
+  aws_s3 = s3
+)
+```
+
+# EC (KPMP celltype)
+
+```{r echo = F}
+ec_kpmp_results <- analyze_pseudotime_by_celltype(
+  so = attempt_so,
+  celltype_col = "KPMP_celltype",
+  celltype_groups =c("EC-AEA", "EC-AVR", "EC-GC", "EC-LYM", "EC-PTC"),
+  start_cluster = "EC-GC",
+  custom_colors = color_5,
+  suffix = "ec_kpmp",
+  aws_s3 = s3
+)
+```
+
+# EC (non-KPMP celltype)
+
+```{r echo = F}
+ec_results <- analyze_pseudotime_by_celltype(
+  so = attempt_so,
+  celltype_col = "celltype",
+  celltype_groups = c("EC-PTC", "EC-GC", "EC-AEA", "EC-LYM"),
+  start_cluster = "EC-GC",
+  custom_colors = color_5,
+  suffix = "ec",
+  aws_s3 = s3
+)
+```

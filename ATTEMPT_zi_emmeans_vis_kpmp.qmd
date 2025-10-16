@@ -1,0 +1,1195 @@
+---
+title: "ATTEMPT (KPMP cell types) emmeans visualization"
+author: "Ye Ji Choi"
+date: "r lubridate::today()"
+format: 
+  html:
+    toc: true
+    toc-depth: 5
+    toc-location: left
+    code-fold: true
+    embed-resources: true
+---
+
+
+```{r echo = F, include = F}
+library(jsonlite)
+library(aws.s3)
+library(dplyr)
+library(kableExtra)
+library(knitr)
+library(ggplot2)
+library(purrr)
+library(tidyr)
+library(stats)
+library(patchwork)
+library(UpSetR)
+library(readxl)
+library(fgsea)
+library(ReactomeGSA)
+library(GSEABase)
+library(enrichplot)
+library(enrichR)
+library(ggrepel)
+library(forcats)
+library(stringr)
+library(ComplexUpset)
+library(ggupset)
+library(Hmisc)
+library(ggrounded)
+library(circlize)
+library(tidyverse)
+library(openxlsx)
+library(biomaRt)
+```
+
+```{r echo = F, include = F}
+source("~/GitHub/CHCO-Code/Petter Bjornstad/ATTEMPT/attempt_functions.R")
+```
+
+```{r include = F}
+## Create an S3 client
+keys <- fromJSON("/Users/choiyej/Library/CloudStorage/OneDrive-TheUniversityofColoradoDenver/Bjornstad Pyle Lab/keys.json")
+
+Sys.setenv(
+  "AWS_ACCESS_KEY_ID" = keys$MY_ACCESS_KEY,
+  "AWS_SECRET_ACCESS_KEY" = keys$MY_SECRET_KEY,
+  "AWS_DEFAULT_REGION" = "",
+  "AWS_REGION" = "",
+  "AWS_S3_ENDPOINT" = "s3.kopah.uw.edu"
+)
+```
+
+# nebula
+
+```{r echo = F}
+## read mixed model results dataframe (rendered in Hyak)
+# process and read all results from ATTEMPT
+
+# Define genes to exclude by cell type
+genes_to_exclude <- list(
+  IC = c("SLC12A1", "UMOD", "GSTA1", "GSTA2", "TAGLN", "SLC22A2", "AC104041.1", "CASR", "AC068051.1"),
+  POD = c("PCDH7", "CNTN4"),
+  Immune = c("CA2", "KL", "GPX3"),
+  Immune_lymphoid = c("CA2"),
+  Immune_myeloid = c("CA2", "KL", "GPX3")
+)
+
+celltype_groups <- list(
+  PT = c("PT-S1/S2", "PT-S3", "aPT"),
+  TAL = c("C-TAL-1", "C-TAL-2", "aTAL", "dTAL"),
+  PC = c("CCD-PC", "CNT-PC", "dCCD-PC", "M-PC", "tPC-IC"),
+  EC = c("EC-AVR", "EC-GC", "EC-PTC", "EC-AEA", "EC-LYM", "EC/VSMC"),
+  IC = c("IC-A", "IC-B", "aIC"),
+  Immune = c("MAC", "MON", "cDC", "pDC", "CD4+ T", "CD8+ T", "B", "NK"),
+  Immune_myeloid = c("MAC", "MON", "cDC", "pDC"),
+  Immune_lymphoid = c("CD4+ T", "CD8+ T", "B", "NK"),
+  VSMC_P_FIB = c("VSMC/P", "FIB"),
+  POD = "POD"
+)
+
+## read mixed model results dataframe (rendered in Hyak)
+mart <- useMart("ensembl", dataset = "hsapiens_gene_ensembl")
+
+# Top 2000 HVG
+for (cell in names(celltype_groups))  {
+  input_path <- paste0("grouped/", cell, "/HVG/nebula/", "grouped_", tolower(cell), "_kpmp_attempt_nebula_res_reml_pooled.rds")
+  cell_df <- s3readRDS(input_path, bucket = "attempt", region = "")
+  processed <- process_nebula_results(cell_df)
+  
+  # Filter out contaminating genes BEFORE annotation
+  if (cell %in% names(genes_to_exclude)) {
+    n_before <- nrow(processed$results)
+    processed$results <- processed$results %>%
+      filter(!Gene %in% genes_to_exclude[[cell]])
+    n_after <- nrow(processed$results)
+    n_removed <- n_before - n_after
+    if (n_removed > 0) {
+      message(sprintf("%s: Removed %d contaminating genes: %s", 
+                      cell, n_removed, 
+                      paste(genes_to_exclude[[cell]][genes_to_exclude[[cell]] %in% unique(processed$results$Gene)], collapse = ", ")))
+    }
+  }
+  
+  # Get gene symbols
+  gene_symbols <- processed$results$Gene
+  
+  # Query Ensembl
+  gene_info <- getBM(
+    attributes = c("hgnc_symbol", "description", "gene_biotype"),
+    filters = "hgnc_symbol",
+    values = gene_symbols,
+    mart = mart
+  ) %>%
+    dplyr::rename(Gene = hgnc_symbol)
+  
+  # Join annotation
+  annotated_df <- processed$results %>%
+    left_join(gene_info, by = "Gene")
+  
+  # Assign to variable dynamically
+  var_name <- paste0(tolower(cell), "_hvg_kpmp")
+  assign(var_name, annotated_df, envir = .GlobalEnv)
+  
+  write.csv(annotated_df, paste0("/Users/choiyej/Library/CloudStorage/OneDrive-SharedLibraries-UW/Laura Pyle - Bjornstad/Biostatistics Core Shared Drive/ATTEMPT/Results/nebula/", tolower(cell), "_kpmp_hvg_res.csv"), row.names = F)
+}
+
+# Top 2000 HVG subtypes
+for (cell in unlist(celltype_groups))  {
+  print(paste0("Processing: ", cell))
+  cell_clean <- gsub("/", "_", cell)
+  input_path <- paste0("individual/", cell_clean, "/HVG/nebula/individual_", 
+                       tolower(cell_clean),
+                       "_kpmp_attempt_nebula_res_reml_pooled.rds")
+  cell_df <- s3readRDS(input_path, bucket = "attempt", region = "")
+  
+  processed <- process_nebula_results(cell_df)
+  
+  # Check if processed results has 0 rows
+  if (nrow(processed$results) == 0) {
+    print(paste0("Skipping ", cell, " - no rows in processed results"))
+    next
+  }
+  
+  # Determine which exclusion list(s) to use based on parent cell type(s)
+  parent_cells <- names(celltype_groups)[sapply(celltype_groups, function(x) cell %in% x)]
+  
+  # Collect all genes to exclude from all matching parent cell types
+  genes_to_remove <- unique(unlist(genes_to_exclude[parent_cells]))
+  
+  if (length(genes_to_remove) > 0) {
+    n_before <- nrow(processed$results)
+    genes_present <- intersect(genes_to_remove, processed$results$Gene)
+    processed$results <- processed$results %>%
+      filter(!Gene %in% genes_to_remove)
+    n_after <- nrow(processed$results)
+    n_removed <- n_before - n_after
+    if (n_removed > 0) {
+      message(sprintf("%s (subtype of %s): Removed %d contaminating genes: %s", 
+                      cell, paste(parent_cells, collapse = ", "), n_removed,
+                      paste(genes_present, collapse = ", ")))
+    }
+  }
+  
+  # Get gene symbols
+  gene_symbols <- processed$results$Gene
+  
+  # Query Ensembl
+  gene_info <- getBM(
+    attributes = c("hgnc_symbol", "description", "gene_biotype"),
+    filters = "hgnc_symbol",
+    values = gene_symbols,
+    mart = mart
+  ) %>%
+    dplyr::rename(Gene = hgnc_symbol)
+  
+  # Join annotation
+  annotated_df <- processed$results %>%
+    left_join(gene_info, by = "Gene")
+  
+  cell_clean <- gsub("-", "_", cell_clean)
+  cell_clean <- gsub("\\+\\s", "_", cell_clean)
+  lower_cell <- tolower(cell_clean)
+  var_name <- paste0(lower_cell, "_hvg_kpmp")
+  print(var_name)
+  assign(var_name, annotated_df, envir = .GlobalEnv)
+  
+  var_name <- paste0(lower_cell, "_hvg_kpmp_cov")
+  assign(var_name, processed$overdispersion)
+  
+  write.csv(annotated_df, paste0("/Users/choiyej/Library/CloudStorage/OneDrive-SharedLibraries-UW/Laura Pyle - Bjornstad/Biostatistics Core Shared Drive/ATTEMPT/Results/nebula/", tolower(cell_clean), "_kpmp_hvg_res.csv"), row.names = F)
+}
+
+# custom <- c("DCT", "CD", "Glom", "VSMC", "Combined_p", "Combined_u")
+# 
+# # Full gene set
+# for (cell in custom)  {
+# print(paste0("Processing: ", cell))
+#   input_path <- paste0("grouped/", cell, "/ALL/nebula/", "grouped_", tolower(cell), "_kpmp_attempt_nebula_res_reml_pooled.rds")
+#   cell_df <- s3readRDS(input_path, bucket = "attempt", region = "")
+# 
+#   processed <- process_nebula_results(cell_df)
+#   lower_cell <- tolower(cell)
+#   var_name <- paste0(lower_cell, "_kpmp")
+# 
+#   assign(var_name, processed$results)
+#   write.csv(processed$results, paste0("/Users/choiyej/Library/CloudStorage/OneDrive-SharedLibraries-UW/Laura Pyle - Bjornstad/Biostatistics Core Shared Drive/ATTEMPT/Results/nebula/", tolower(cell), "_kpmp_res.csv"), row.names = F)
+# }
+# 
+# # Full gene set subtypes
+# for (cell in unlist(celltype_groups))  {
+# print(paste0("Processing: ", cell))
+#   cell <- gsub("/", "_", cell)
+#   input_path <- paste0("individual/", cell, "/ALL/nebula/individual_",
+#                        tolower(cell),
+#                        "_kpmp_attempt_nebula_res_reml_pooled.rds")
+#   cell_df <- s3readRDS(input_path, bucket = "attempt", region = "")
+# 
+#   processed <- process_nebula_results(cell_df)
+#   cell <- gsub("-", "_", cell)
+#   lower_cell <- tolower(cell)
+#   var_name <- paste0(lower_cell, "_kpmp")
+# 
+#   assign(var_name, processed$results)
+#   write.csv(processed$results, paste0("/Users/choiyej/Library/CloudStorage/OneDrive-SharedLibraries-UW/Laura Pyle - Bjornstad/Biostatistics Core Shared Drive/ATTEMPT/Results/nebula/", tolower(cell), "_kpmp_res.csv"), row.names = F)
+# 
+# }
+```
+
+```{r echo = F, eval = F}
+# save all as one excel spreadsheet with full gene names
+top50_wb <- createWorkbook()
+all_wb <- createWorkbook()
+# Loop through and extract top 50 genes per cell type
+for (cell in names(celltype_groups))  {
+  var_name <- paste0(tolower(cell), "_hvg_kpmp")
+  df <- get(var_name)
+  
+  all_genes <- df %>%
+    arrange(`p_treatmentDapagliflozin:visitPOST`)
+  
+  # Extract top 50 by lowest p-value
+  top_genes <- all_genes %>%
+    slice_head(n = 50)
+
+  # Add a worksheet and write the top genes
+  addWorksheet(all_wb, sheetName = cell)
+  writeData(all_wb, sheet = cell, x = all_genes)
+  
+  addWorksheet(top50_wb, sheetName = cell)
+  writeData(top50_wb, sheet = cell, x = top_genes)
+}
+
+# # Save the workbook
+saveWorkbook(all_wb, file = "/Users/choiyej/Library/CloudStorage/OneDrive-SharedLibraries-UW/Laura Pyle - Bjornstad/Biostatistics Core Shared Drive/ATTEMPT/Results/all_hvg_nebula_results_by_kpmp_celltype.xlsx", overwrite = TRUE)
+saveWorkbook(top50_wb, file = "/Users/choiyej/Library/CloudStorage/OneDrive-SharedLibraries-UW/Laura Pyle - Bjornstad/Biostatistics Core Shared Drive/ATTEMPT/Results/top50_hvg_nebula_results_by_kpmp_celltype.xlsx", overwrite = TRUE)
+```
+
+#### IPA input save
+
+```{r echo = F, eval = F}
+# save input for IPA
+for (cell in names(celltype_groups)){
+  ## HVG
+  hvg_df <- get(paste0(tolower(cell), "_hvg_kpmp"))
+  hvg_ipa_DiD <- hvg_df %>%
+    dplyr::select(Gene, `logFC_treatmentDapagliflozin:visitPOST`, `p_treatmentDapagliflozin:visitPOST`, fdr)
+  colnames(hvg_ipa_DiD) <- c("Gene", "Log Fold Change", "Expr p-value", "Expr False Discovery Rate")
+  
+  write.csv(hvg_ipa_DiD, paste0("/Users/choiyej/Library/CloudStorage/OneDrive-SharedLibraries-UW/Laura Pyle - Bjornstad/Biostatistics Core Shared Drive/ATTEMPT/Results/emmeans/kpmp/nebula/", 
+                            tolower(cell), "_nebula_pooled_ipa_input_DiD.csv"), row.names = F)
+  
+    ## FULL
+  df <- get(paste0(tolower(cell), "_kpmp"))
+  ipa_DiD <- df %>%
+    dplyr::select(Gene, `logFC_treatmentDapagliflozin:visitPOST`, `p_treatmentDapagliflozin:visitPOST`, fdr)
+  colnames(ipa_DiD) <- c("Gene", "Log Fold Change", "Expr p-value", "Expr False Discovery Rate")
+  
+  write.csv(ipa_DiD, paste0("/Users/choiyej/Library/CloudStorage/OneDrive-SharedLibraries-UW/Laura Pyle - Bjornstad/Biostatistics Core Shared Drive/ATTEMPT/Results/emmeans/kpmp/nebula/", 
+                            tolower(cell), "_nebula_pooled_ipa_input_DiD_full.csv"), row.names = F)
+  
+}
+```
+
+# Volcanos
+
+```{r echo = F}
+# HVG
+for (cell in names(celltype_groups)) {
+  lower_cell <- tolower(cell)
+  df_name <- paste0(lower_cell, "_hvg_kpmp")
+  df <- get(df_name)
+  
+  plot_volcano(df, "logFC_treatmentDapagliflozin:visitPOST", 
+             "p_treatmentDapagliflozin:visitPOST",
+             NULL,
+             "logFC Treatment(Dapagliflozin):Visit(POST)", 
+             "-log10(p-value)",
+             paste0("nebula/", df_name, "_kpmp_DiD"),
+             formula = "treatment * visit",
+             cell_type = cell)
+
+plot_volcano(df, "logFC_treatmentDapagliflozin:visitPOST", 
+             "fdr",
+             NULL,
+             "logFC Treatment(Dapagliflozin):Visit(POST)", 
+             "-log10(FDR adjusted p-value)",
+             paste0("nebula/", df_name, "_kpmp_DiD"),
+             formula = "treatment * visit",
+             cell_type = cell)
+  
+}
+
+# ALL
+for (cell in names(celltype_groups)) {
+  lower_cell <- tolower(cell)
+  df_name <- paste0(lower_cell, "_kpmp")
+  df <- get(df_name)
+  
+  plot_volcano(df, "logFC_treatmentDapagliflozin:visitPOST", 
+             "p_treatmentDapagliflozin:visitPOST",
+             NULL,
+             "logFC Treatment(Dapagliflozin):Visit(POST)", 
+             "-log10(p-value)",
+             paste0("nebula/", df_name, "_kpmp_DiD"),
+             formula = "treatment * visit",
+             cell_type = cell)
+
+plot_volcano(df, "logFC_treatmentDapagliflozin:visitPOST", 
+             "fdr",
+             NULL,
+             "logFC Treatment(Dapagliflozin):Visit(POST)", 
+             "-log10(FDR adjusted p-value)",
+             paste0("nebula/", df_name, "_kpmp_DiD"),
+             formula = "treatment * visit",
+             cell_type = cell)
+}
+
+
+# cell = "EC_GC"
+#   lower_cell <- tolower(cell)
+#   df_name <- paste0(lower_cell, "_hvg_kpmp")
+#   df <- get(df_name)
+#   
+#   plot_volcano(df, "logFC_treatmentDapagliflozin:visitPOST", 
+#              "p_treatmentDapagliflozin:visitPOST",
+#              NULL,
+#              "logFC Treatment(Dapagliflozin):Visit(POST)", 
+#              "-log10(p-value)",
+#              paste0("nebula/", df_name, "_kpmp_DiD"),
+#              formula = "treatment * visit",
+#              cell_type = cell)
+# 
+# plot_volcano(df, "logFC_treatmentDapagliflozin:visitPOST", 
+#              "fdr",
+#              NULL,
+#              "logFC Treatment(Dapagliflozin):Visit(POST)", 
+#              "-log10(FDR adjusted p-value)",
+#              paste0("nebula/", df_name, "_kpmp_DiD"),
+#              formula = "treatment * visit",
+#              cell_type = cell)
+```
+
+### PT
+
+#### PT Subtypes
+
+```{r echo = F}
+pt_plots <- create_gene_expression_plots(
+  main_results = pt_hvg_kpmp,
+  subtype_results_list = list(
+    "PT-S1/S2" = pt_s1_s2_hvg_kpmp,
+    "PT-S3" = pt_s3_hvg_kpmp,
+    "aPT" = apt_hvg_kpmp
+  ),
+  cell_type_prefix = "PT",
+  cell_type_labels = c("PT-S1/S2", "PT-S3", "aPT"),
+  output_prefix = "kpmp_PT_hvg",
+  full_formula = T,
+  volcano_text_size = 15,
+  volcano_caption_size = 12,
+  formula = "treatment * visit",
+  output_dir = "/Users/choiyej/Library/CloudStorage/OneDrive-SharedLibraries-UW/Laura Pyle - Bjornstad/Biostatistics Core Shared Drive/ATTEMPT/Results/Figures/Dot Plots/"
+)
+pt_plots$combined_plot
+```
+
+
+### TAL
+
+#### TAL Subtypes
+
+```{r echo = F}
+tal_plots <- create_gene_expression_plots(
+  main_results = tal_hvg_kpmp,
+  subtype_results_list = list(
+    "C-TAL-1" = c_tal_1_hvg_kpmp,
+    "C-TAL-2" = c_tal_2_hvg_kpmp,
+    "aTAL" = atal_hvg_kpmp,
+    "dTAL" = dtal_hvg_kpmp
+  ),
+  cell_type_prefix = "TAL",
+  cell_type_labels = c("C-TAL-1", "C-TAL-2", "aTAL", "dTAL"),
+  output_prefix = "kpmp_TAL_hvg",
+  full_formula = TRUE,
+  volcano_text_size = 15,
+  volcano_caption_size = 12,
+  formula = "treatment * visit",
+  output_dir = "/Users/choiyej/Library/CloudStorage/OneDrive-SharedLibraries-UW/Laura Pyle - Bjornstad/Biostatistics Core Shared Drive/ATTEMPT/Results/Figures/Dot Plots/"
+)
+tal_plots$combined_plot
+```
+
+### PC
+
+#### PC Subtypes
+
+```{r echo = F}
+pc_plots <- create_gene_expression_plots(
+  main_results = pc_hvg_kpmp,
+  subtype_results_list = list(
+    "CCD-PC" = ccd_pc_hvg_kpmp,
+    "CNT-PC" = cnt_pc_hvg_kpmp,
+    "dCCD-PC" = dccd_pc_hvg_kpmp,
+    "M-PC" = m_pc_hvg_kpmp,
+    "tPC-IC" = tpc_ic_hvg_kpmp
+  ),
+  cell_type_prefix = "PC",
+  cell_type_labels = c("CCD-PC", "CNT-PC", "dCCD-PC", "M-PC", "tPC-IC"),
+  output_prefix = "kpmp_PC_hvg",
+  full_formula = TRUE,
+  volcano_text_size = 15,
+  volcano_caption_size = 12,
+  formula = "treatment * visit",
+  output_dir = "/Users/choiyej/Library/CloudStorage/OneDrive-SharedLibraries-UW/Laura Pyle - Bjornstad/Biostatistics Core Shared Drive/ATTEMPT/Results/Figures/Dot Plots/"
+)
+```
+
+### Immune (very few cells)
+
+#### Immune Subtypes
+
+```{r echo = F}
+immune_plots <- create_gene_expression_plots(
+  main_results = immune_hvg_kpmp,
+  subtype_results_list = list(
+    "MAC" = mac_hvg_kpmp,
+    "MON" = mon_hvg_kpmp,
+    "cDC" = cdc_hvg_kpmp,
+    # "pDC" = pdc_hvg_kpmp,
+    "CD4+ T" = cd4_t_hvg_kpmp,
+    "CD8+ T" = cd8_t_hvg_kpmp,
+    "B" = b_hvg_kpmp,
+    "NK" = nk_hvg_kpmp
+  ),
+  cell_type_prefix = "Immune",
+  cell_type_labels = c("MAC", "MON", "cDC",  "CD4+ T", "CD8+ T", "B", "NK"),
+  output_prefix = "kpmp_Immune_hvg",
+  full_formula = TRUE,
+  volcano_text_size = 15,
+  volcano_caption_size = 12,
+  formula = "treatment * visit",
+  output_dir = "/Users/choiyej/Library/CloudStorage/OneDrive-SharedLibraries-UW/Laura Pyle - Bjornstad/Biostatistics Core Shared Drive/ATTEMPT/Results/Figures/Dot Plots/"
+)
+
+```
+
+
+### Immune (Myeloid)
+
+#### Immune Subtypes (Myeloid)
+
+```{r echo = F}
+immune_myeloid_plots <- create_gene_expression_plots(
+  main_results = immune_myeloid_hvg_kpmp,
+  subtype_results_list = list(
+    "MAC" = mac_hvg_kpmp,
+    "MON" = mon_hvg_kpmp,
+    "cDC" = cdc_hvg_kpmp
+    # "pDC" = pdc_hvg_kpmp
+  ),
+  cell_type_prefix = "Immune Myeloid",
+  cell_type_labels = c("MAC", "MON", "cDC"),
+  output_prefix = "kpmp_Immune_Myeloid_hvg",
+  full_formula = TRUE,
+  volcano_text_size = 15,
+  volcano_caption_size = 12,
+  formula = "treatment * visit",
+  output_dir = "/Users/choiyej/Library/CloudStorage/OneDrive-SharedLibraries-UW/Laura Pyle - Bjornstad/Biostatistics Core Shared Drive/ATTEMPT/Results/Figures/Dot Plots/"
+)
+
+```
+
+### Immune (Lymphoid)
+
+#### Immune Subtypes (Lymphoid)
+
+```{r echo = F}
+immune_lymphoid_plots <- create_gene_expression_plots(
+  main_results = immune_lymphoid_hvg_kpmp,
+  subtype_results_list = list(
+    "CD4+ T" = cd4_t_hvg_kpmp,
+    "CD8+ T" = cd8_t_hvg_kpmp,
+    "B" = b_hvg_kpmp,
+    "NK" = nk_hvg_kpmp
+  ),
+  cell_type_prefix = "Immune Lymphoid",
+  cell_type_labels = c("CD4+ T", "CD8+ T", "B", "NK"),
+  output_prefix = "kpmp_Immune_Lymphoid_hvg",
+  full_formula = TRUE,
+  volcano_text_size = 15,
+  volcano_caption_size = 12,
+  formula = "treatment * visit",
+  output_dir = "/Users/choiyej/Library/CloudStorage/OneDrive-SharedLibraries-UW/Laura Pyle - Bjornstad/Biostatistics Core Shared Drive/ATTEMPT/Results/Figures/Dot Plots/"
+)
+
+```
+
+### IC
+
+#### IC Subtypes
+
+```{r echo = F}
+ic_plots <- create_gene_expression_plots(
+  main_results = ic_hvg_kpmp,
+  subtype_results_list = list(
+    "IC-A" = ic_a_hvg_kpmp,
+    "IC-B" = ic_b_hvg_kpmp,
+    "aIC" = aic_hvg_kpmp
+  ),
+  cell_type_prefix = "IC",
+  cell_type_labels = c("IC-A", "IC-B", "aIC"),
+  output_prefix = "kpmp_IC_hvg",
+  full_formula = TRUE,
+  volcano_text_size = 15,
+  volcano_caption_size = 12,
+  formula = "treatment * visit",
+  output_dir = "/Users/choiyej/Library/CloudStorage/OneDrive-SharedLibraries-UW/Laura Pyle - Bjornstad/Biostatistics Core Shared Drive/ATTEMPT/Results/Figures/Dot Plots/"
+)
+ic_plots$volcano_plot
+```
+
+
+### EC
+
+#### EC Subtypes
+
+```{r echo = F}
+ec_plots <- create_gene_expression_plots(
+  main_results = ec_hvg_kpmp,
+  subtype_results_list = list(
+    "EC-AVR" = ec_avr_hvg_kpmp,
+    "EC-GC" = ec_gc_hvg_kpmp,
+    "EC-PTC" = ec_ptc_hvg_kpmp,
+    "EC-AEA" = ec_aea_hvg_kpmp,
+    "EC-LYM" = ec_lym_hvg_kpmp,
+    "EC/VSMC" = ec_vsmc_hvg_kpmp
+  ),
+  cell_type_prefix = "EC",
+  cell_type_labels = c("EC-AVR", "EC-GC", "EC-PTC", "EC-AEA", "EC-LYM", "EC/VSMC"),
+  output_prefix = "kpmp_EC_hvg",
+  full_formula = TRUE,
+  volcano_text_size = 15,
+  volcano_caption_size = 12,
+  formula = "treatment * visit",
+  output_dir = "/Users/choiyej/Library/CloudStorage/OneDrive-SharedLibraries-UW/Laura Pyle - Bjornstad/Biostatistics Core Shared Drive/ATTEMPT/Results/Figures/Dot Plots/"
+)
+```
+
+
+### FIB/VSMC/P
+
+#### FIBVSMCP Subtypes
+
+```{r echo = F}
+vsmc_p_fib_plots <- create_gene_expression_plots(
+  main_results = vsmc_p_fib_hvg_kpmp,
+  subtype_results_list = list(
+    "VSMC/P" = vsmc_p_hvg_kpmp,
+    "FIB" = fib_hvg_kpmp
+  ),
+  cell_type_prefix = "VSMC_P_FIB",
+  cell_type_labels = c("VSMC/P", "FIB"),
+  output_prefix = "kpmp_VSMC_P_FIB_hvg",
+  full_formula = TRUE,
+  volcano_text_size = 15,
+  volcano_caption_size = 12,
+  formula = "treatment * visit",
+  output_dir = "/Users/choiyej/Library/CloudStorage/OneDrive-SharedLibraries-UW/Laura Pyle - Bjornstad/Biostatistics Core Shared Drive/ATTEMPT/Results/Figures/Dot Plots/"
+)
+```
+
+### POD
+
+```{r echo = F}
+pod_hvg_plots <- create_gene_expression_plots(
+  main_results = pod_hvg_kpmp,
+  subtype_results_list = list(
+    "POD" = pod_hvg_kpmp),
+  cell_type_labels = c("POD"),
+  cell_type_prefix = "POD",
+  formula = "treatment * visit",
+  output_prefix = "kpmp_POD_hvg",
+  full_formula = T,
+  volcano_text_size = 15,
+  volcano_caption_size = 12,
+  output_dir = "/Users/choiyej/Library/CloudStorage/OneDrive-SharedLibraries-UW/Laura Pyle - Bjornstad/Biostatistics Core Shared Drive/ATTEMPT/Results/Figures/Dot Plots/"
+)
+pod_hvg_plots$combined_plot
+```
+
+```{r echo = F}
+pod_plots <- create_gene_expression_plots(
+  main_results = pod_kpmp,
+  subtype_results_list = list(
+    "POD" = pod_kpmp),
+  cell_type_labels = c("POD"),
+  cell_type_prefix = "POD",
+  formula = "treatment * visit",
+  output_prefix = "kpmp_POD",
+  full_formula = T,
+  volcano_text_size = 15,
+  volcano_caption_size = 12,
+  output_dir = "/Users/choiyej/Library/CloudStorage/OneDrive-SharedLibraries-UW/Laura Pyle - Bjornstad/Biostatistics Core Shared Drive/ATTEMPT/Results/Figures/Dot Plots/"
+)
+```
+
+## Combined volcano
+
+```{r echo = F}
+# plot_volcano(pt_hvg_kpmp, "logFC_treatmentDapagliflozin:visitPOST", 
+#              "fdr",
+#              "PT (REML & pooled Offset)", 
+#              "logFC Treatment(Dapagliflozin):Visit(POST)", 
+#              "-log10(FDR adjusted p-value)",
+#              "nebula/pt_hvg_kpmp_DiD")
+
+combined_nebula_reml_pooled <- 
+  rbind(pt_hvg_kpmp %>%
+          mutate(celltype = "PT"), 
+        tal_hvg_kpmp %>%
+          mutate(celltype = "TAL"),
+        pc_hvg_kpmp %>%
+          mutate(celltype = "PC"),
+        immune_hvg_kpmp %>%
+          mutate(celltype = "Immune"),
+        immune_myeloid_hvg_kpmp %>%
+          filter(`logFC_treatmentDapagliflozin:visitPOST` > -10) %>%
+          mutate(celltype = "Immune (Myeloid)"),
+        immune_lymphoid_hvg_kpmp %>%
+          filter(`logFC_treatmentDapagliflozin:visitPOST` > -10) %>%
+          mutate(celltype = "Immune (Lymphoid)"),
+        ic_hvg_kpmp %>%
+          mutate(celltype = "IC"),
+        ec_hvg_kpmp %>%
+          mutate(celltype = "EC"),
+        vsmc_p_fib_hvg_kpmp %>%
+          mutate(celltype = "VSMC_P_FIB"),
+        pod_hvg_kpmp %>%
+          filter(`logFC_treatmentDapagliflozin:visitPOST` > -10) %>%
+          mutate(celltype = "POD")) %>%
+  mutate(fdr_cat = case_when(fdr < 0.05 & 
+                               `logFC_treatmentDapagliflozin:visitPOST` > 0 ~
+                               "Positive & P < 0.05",
+                             fdr < 0.05 & 
+                               `logFC_treatmentDapagliflozin:visitPOST` < 0 ~
+                               "Negative & P < 0.05",
+                             T ~ "P > 0.05"))
+
+combined_nebula_reml_pooled$celltype <- factor(combined_nebula_reml_pooled$celltype, 
+                                               labels = c("PT", "TAL","EC","IC", "POD", "PC",
+                                                                "VSMC/P, FIB", "Immune", 
+                                                                "Immune (L)", "Immune (M)"),
+                                               levels = c("PT", "TAL","EC","IC", "POD", "PC",
+                                                                "VSMC_P_FIB", "Immune", "Immune (Lymphoid)", 
+                                                                "Immune (Myeloid)"))
+
+# volcano plot with no label
+combined_nebula_reml_pooled %>%
+  filter(`logFC_treatmentDapagliflozin:visitPOST` < 10) %>%
+  ggplot(aes(x = celltype, 
+             y = `logFC_treatmentDapagliflozin:visitPOST`, 
+             color = fdr_cat)) +
+  geom_jitter(alpha = 0.3, size = 2) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  theme(panel.grid = element_blank(),
+        panel.background = element_blank(),
+        legend.position = "none",
+        axis.text.x = element_text(angle = 60, hjust = 1),
+        axis.ticks.x = element_blank(),
+        text = element_text(size = 15),
+        plot.margin = margin(0, 0, 0, 0)) +
+  labs(x = NULL, 
+       y = "DiD") +
+  scale_color_manual(values = c("#457b9d", "#ced4da", "#f28482"))
+ggsave("/Users/choiyej/Library/CloudStorage/OneDrive-SharedLibraries-UW/Laura Pyle - Bjornstad/Biostatistics Core Shared Drive/ATTEMPT/Results/Figures/Cell type comparison/celltype_deg_combined_kpmp.png", width = 5, height = 4, dpi = 600)
+
+
+# find genes that are significant in more than one celltype
+shared_genes <- combined_nebula_reml_pooled %>%
+  filter(fdr < 0.05) %>%
+  group_by(Gene) %>%
+  dplyr::summarise(sig_gene_count = n(), .groups = "drop") %>%
+  filter(sig_gene_count > 1) %>%
+  arrange(desc(sig_gene_count)) %>%
+  pull(Gene)
+
+combined_nebula_reml_pooled %>%
+  filter(`logFC_treatmentDapagliflozin:visitPOST` < 10) %>%
+  ggplot(aes(x = celltype, 
+             y = `logFC_treatmentDapagliflozin:visitPOST`, 
+             color = fdr_cat)) +
+  geom_jitter(alpha = 0.3) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  geom_text_repel(data = . %>% filter(Gene %in% shared_genes),
+                  aes(label = Gene),
+                  size = 3,
+                  max.overlaps = 100,
+                  box.padding = 0.3,
+                  point.padding = 0.2,
+                  segment.size = 0.2,
+                  show.legend = FALSE,
+                  color = "black",
+                  fontface = "bold") +
+  theme(panel.grid = element_blank(),
+        panel.background = element_blank(),
+        legend.position = "none") +
+  labs(x = NULL, 
+       y = "Interaction logFC") +
+  scale_color_manual(values = c("#457b9d", "#ced4da", "#f28482"))
+
+# label genes in TCA cycle
+tca_genes <- c(
+  "ACO1", "ACO2", "IDH1", "IDH2", "IDH3A", "IDH3B", "IDH3G", "OGDH", "OGDHL",
+  "SUCLA2", "SUCLG1", "SUCLG2", "SDHA", "SDHB", "SDHC", "SDHD", "FH", "MDH1",
+  "MDH2", "FAS", "CS"
+)
+
+combined_nebula_reml_pooled %>%
+  filter(`logFC_treatmentDapagliflozin:visitPOST` < 10) %>%
+  ggplot(aes(x = celltype, 
+             y = `logFC_treatmentDapagliflozin:visitPOST`, 
+             color = fdr_cat)) +
+  geom_jitter(alpha = 0.3) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  geom_text_repel(data = . %>% filter(Gene %in% tca_genes),
+                  aes(label = Gene),
+                  size = 3,
+                  max.overlaps = 100,
+                  box.padding = 0.3,
+                  point.padding = 0.2,
+                  min.segment.length = 0,
+                  force = 150,
+                  segment.size = 0.2,
+                  show.legend = FALSE,
+                  fontface = "bold") +
+  theme(panel.grid = element_blank(),
+        panel.background = element_blank(),
+        legend.position = "none") +
+  labs(x = NULL, 
+       y = "Interaction logFC") +
+  scale_color_manual(values = c("#457b9d", "#ced4da", "#f28482"))
+
+# label genes in oxphos cycle
+oxphos_genes <- c(
+  "NDUFS6",  "SDHB", "SDHC", "SDHD",
+  "UQCRC1", "UQCRC2", "COX4I1", "COX4I2", "ATP5PF"
+)
+combined_nebula_reml_pooled %>%
+  filter(`logFC_treatmentDapagliflozin:visitPOST` < 10) %>%
+  ggplot(aes(x = celltype, 
+             y = `logFC_treatmentDapagliflozin:visitPOST`, 
+             color = fdr_cat)) +
+  geom_jitter(alpha = 0.3) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  geom_text_repel(data = . %>% filter(Gene %in% oxphos_genes),
+                  aes(label = Gene),
+                  size = 3,
+                  max.overlaps = 100,
+                  box.padding = 0.3,
+                  point.padding = 0.2,
+                  min.segment.length = 0,
+                  force = 150,
+                  segment.size = 0.2,
+                  show.legend = FALSE,
+                  fontface = "bold") +
+  theme(panel.grid = element_blank(),
+        panel.background = element_blank(),
+        legend.position = "none") +
+  labs(x = NULL, 
+       y = "Interaction logFC") +
+  scale_color_manual(values = c("#457b9d", "#ced4da", "#f28482"))
+
+# ggsave(
+#   filename = "",
+#   width = 4,
+#   height = 4,
+#   dpi = 300
+# )
+
+```
+
+## Number of DEGs
+
+```{r echo = F}
+celltype_groups <- list(
+  PT = c("PT-S1/S2", "PT-S3", "aPT"),
+  TAL = c("C-TAL-1", "C-TAL-2", "aTAL", "dTAL"),
+  PC = c("CCD-PC", "CNT-PC", "dCCD-PC", "M-PC", "tPC-IC"),
+  EC = c("EC-AVR", "EC-GC", "EC-PTC", "EC-AEA", "EC-LYM", "EC/VSMC"),
+  IC = c("IC-A", "IC-B", "aIC"),
+  Immune = c("MAC", "MON", "cDC", "pDC", "CD4+ T", "CD8+ T", "B", "NK"),
+  Immune_myeloid = c("MAC", "MON", "cDC", "pDC"),
+  Immune_lymphoid = c("CD4+ T", "CD8+ T", "B", "NK"),
+  VSMC_P_FIB = c("VSMC/P", "FIB"),
+  POD = "POD"
+)
+celltype_list <- tolower(names(celltype_groups))
+names_hvg_kpmp <- paste0(celltype_list, "_hvg_kpmp")
+
+# Create a named list of data frames
+df_list <- mget(names_hvg_kpmp)
+names(df_list) <- toupper(celltype_list)  # Set uppercase names for celltype labeling
+
+# Combine and add celltype column
+combined <- bind_rows(df_list, .id = "celltype")
+
+# Create the summary table
+deg_summary <- combined %>%
+ dplyr::mutate(direction_fdr = case_when(
+    `logFC_treatmentDapagliflozin:visitPOST` > 0 & fdr < 0.05 ~ "+",
+    `logFC_treatmentDapagliflozin:visitPOST` < 0 & fdr < 0.05 ~ "-",
+    TRUE ~ "NS")) %>%
+  filter(direction_fdr != "NS") %>%
+  dplyr::select(direction_fdr, celltype) %>%
+  table() %>%
+  as.data.frame()
+deg_summary$celltype <- factor(deg_summary$celltype, labels = c("PT", "TAL","EC","IC", "POD", "PC",
+                                                                "VSMC/P, FIB", "Immune", 
+                                                                "Immune (L)", "Immune (M)"),
+                               levels = c("PT", "TAL","EC","IC", "POD", "PC",
+                                                                "VSMC_P_FIB", "IMMUNE", 
+                                                                "IMMUNE_LYMPHOID", "IMMUNE_MYELOID"))
+deg_summary$direction_fdr <- factor(deg_summary$direction_fdr, levels = c("+", "-"))
+
+# Create the summary table
+deg_summary_wide <- combined %>%
+  dplyr::mutate(direction_fdr = case_when(
+    `logFC_treatmentDapagliflozin:visitPOST` > 0 & fdr < 0.05 ~ "+",
+    `logFC_treatmentDapagliflozin:visitPOST` < 0 & fdr < 0.05 ~ "-",
+    TRUE ~ "NS")) %>%
+  filter(direction_fdr != "NS") %>%
+  dplyr::count(direction_fdr, celltype) %>%
+  pivot_wider(names_from = celltype, values_from = n, values_fill = 0) %>%
+  as.data.frame()
+
+save(deg_summary_wide, file = "/Users/choiyej/Library/CloudStorage/OneDrive-SharedLibraries-UW/Laura Pyle - Bjornstad/Biostatistics Core Shared Drive/ATTEMPT/Results/model comparison/celltype_deg_comparison_kpmp.RData")
+
+deg_summary %>%
+  mutate(Freq = case_when(direction_fdr == "-" ~ -Freq, T ~ Freq)) %>%
+  ggplot(aes(x = celltype, y = Freq, fill = direction_fdr)) +
+  geom_col(position = "stack") +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "#343a40") +
+  theme(panel.grid = element_blank(),
+        plot.background = element_blank(),
+        panel.background = element_blank(),
+        legend.background = element_blank(),
+        axis.text.x = element_text(angle = 60, hjust = 1),
+        axis.ticks.x = element_blank(),
+        text = element_text(size = 15),
+        legend.position = c(0.8, 0.8),
+        plot.margin = margin(0, 0, 0, 0)) +
+  scale_fill_manual(values = c("-" = "#457b9d",
+                               "+" = "#f28482")) +
+  labs(fill = "DiD Direction", 
+       x = NULL)
+
+ggsave("/Users/choiyej/Library/CloudStorage/OneDrive-SharedLibraries-UW/Laura Pyle - Bjornstad/Biostatistics Core Shared Drive/ATTEMPT/Results/Figures/Cell type comparison/celltype_deg_stacked_barplot_kpmp.png",
+       width = 5, height = 4, dpi = 600)
+```
+
+## Transcript overlap analysis
+
+```{r echo = F}
+# upset plot
+# combined
+upset_combined_dat <- combined %>%
+  filter(fdr < 0.05) %>%
+  mutate(direction_fdr = case_when(`logFC_treatmentDapagliflozin:visitPOST` > 0.5 ~ "+",
+                                   `logFC_treatmentDapagliflozin:visitPOST` < -0.5 ~ "-")) %>%
+  filter(!is.na(direction_fdr)) %>%
+  dplyr::select(celltype, Gene) %>%
+  mutate(present = 1) %>%
+  distinct() %>%
+  pivot_wider(names_from = celltype, values_from = present, values_fill = 0) %>%
+  as.data.frame() %>%
+  dplyr::rename(Immune = IMMUNE,
+                `VSMC/P, FIB` = VSMC_P_FIB)
+
+vertical_upset(
+  upset_combined_dat,
+  sets = c("PT", "TAL", "EC", "IC", "POD", "PC", 
+           "VSMC/P, FIB", "Immune"),
+  show_set_sizes = TRUE,
+  connect_lines  = TRUE, 
+  min_size = 3,
+  bar_fill = "#d5d5d5",
+  multi_bar_fill = "#588b8b"
+) + theme_transparent
+
+ggsave(filename = "/Users/choiyej/Library/CloudStorage/OneDrive-SharedLibraries-UW/Laura Pyle - Bjornstad/Biostatistics Core Shared Drive/ATTEMPT/Results/Figures/Cell type comparison/celltype_deg_upset_kpmp.png",
+       width = 5, height = 10, dpi = 300,  bg = "transparent")
+
+```
+
+```{r echo = F}
+combined_sig <- combined %>%
+  filter(fdr < 0.05) %>%
+  dplyr::select(Gene, celltype) %>%
+  filter(celltype %nin% c("IMMUNE_MYELOID", "IMMUNE_LYMPHOID"))
+
+unique_genes_per_celltype <- combined_sig %>%
+  group_by(Gene) %>%
+  mutate(n_celltypes = n()) %>%
+  ungroup() %>%
+  filter(n_celltypes == 1) %>%  # Genes appearing in only one cell type
+  count(celltype) %>%
+  dplyr::rename(unique_genes = n) %>%
+  mutate(unique_genes = unique_genes/2) # duplicates plotted
+
+chord_plot_dat <- combined_sig %>%
+  # Self-join to find all celltype pairs for each gene
+  inner_join(combined_sig, by = "Gene", suffix = c("_1", "_2"), relationship = "many-to-many") %>%
+  # # Remove self-pairs (same celltype)
+  filter(celltype_1 != celltype_2) %>%
+  # Count shared genes between each celltype pair
+  count(celltype_1, celltype_2) %>%
+  # Create symmetric matrix
+  pivot_wider(names_from = celltype_2, values_from = n, values_fill = 0) %>%
+  column_to_rownames("celltype_1") %>%
+  as.matrix()
+chord_plot_dat <- chord_plot_dat[, rownames(chord_plot_dat)]
+# Add unique genes to the diagonal
+for(ct in unique_genes_per_celltype$celltype) {
+  if(ct %in% rownames(chord_plot_dat)) {
+    chord_plot_dat[ct, ct] <- unique_genes_per_celltype$unique_genes[unique_genes_per_celltype$celltype == ct]
+  }
+}
+
+chord_plot_dat[upper.tri(chord_plot_dat)] <- 0
+
+cell_types <- rownames(chord_plot_dat)
+cell_colors <- setNames(c("#f26b21", "#fcec52", "#cbdb47", "#99ca3c", 
+                          "#208b3a", "#fbb040", "#f78e31"), cell_types)
+
+# cell_colors <- setNames(c("#1", "#4", "#5", "#6", 
+#                           "#7", "#3", "#2"), cell_types)
+
+# Create blended colors for ribbons
+col_fun_blend <- function(mat) {
+  n <- nrow(mat)
+  col_mat <- matrix(NA, n, n)
+  for(i in 1:n) {
+    for(j in 1:n) {
+      if(mat[i,j] > 0) {
+        # Blend the two cell type colors
+        col1 <- col2rgb(cell_colors[rownames(mat)[i]])
+        col2 <- col2rgb(cell_colors[rownames(mat)[j]])
+        blended <- rgb((col1[1] + col2[1])/2/255,
+                       (col1[2] + col2[2])/2/255,
+                       (col1[3] + col2[3])/2/255,
+                       alpha = 0.6)
+        col_mat[i,j] <- blended
+      }
+    }
+  }
+  return(col_mat)
+}
+
+chord_colors_blended <- col_fun_blend(chord_plot_dat)
+
+
+# Create a logical matrix with same dimensions as chord_plot_dat
+logical_matrix <- matrix(TRUE, 
+                         nrow = nrow(chord_plot_dat), 
+                         ncol = ncol(chord_plot_dat),
+                         dimnames = list(rownames(chord_plot_dat), 
+                                         colnames(chord_plot_dat)))
+
+# Set diagonal to FALSE
+diag(logical_matrix) <- FALSE
+
+# Open PNG device
+png("/Users/choiyej/Library/CloudStorage/OneDrive-SharedLibraries-UW/Laura Pyle - Bjornstad/Biostatistics Core Shared Drive/ATTEMPT/Results/Figures/Proportions/celltype_deg_chordplot.png", width = 800, height = 800, res = 150)
+
+# Your plotting code
+circos.clear()
+chordDiagram(chord_plot_dat, transparency = 0.1,
+             grid.col = cell_colors,
+             col = chord_colors_blended,
+             annotationTrack = c("name", "grid"),
+             link.largest.ontop = T,
+             self.link = 1,
+             link.visible = logical_matrix,
+             link.sort = T,
+             link.decreasing = T)
+
+# Close the device
+dev.off()
+circos.clear()
+```
+
+```{r echo = F}
+# Create set sizes data frame
+set_sizes_df <- combined_sig %>%
+  count(celltype) %>%
+  filter(celltype %in% cell_types) %>%
+  arrange(match(celltype, cell_types))
+
+# Initialize the plot
+circos.clear()
+circos.par("track.height" = 0.1, 
+           "gap.after" = rep(3, length(cell_types)),
+           "start.degree" = 90)
+
+# par(
+#   family = "Outfit", cex = 2, col = "black", # font family, size, color
+#   mai = rep(0.5, 4) # plot margin in inches
+# ) 
+
+# Create chord diagram
+chordDiagram(chord_plot_dat, 
+             transparency = 0.1,
+             grid.col = cell_colors,
+             col = chord_colors_blended,
+             annotationTrack = c("name", "grid"),
+             link.largest.ontop = T,
+             self.link = 1,
+             link.visible = logical_matrix,
+             link.sort = T,
+             link.decreasing = T,
+             link.border = "black", link.lwd = 0.2,
+             preAllocateTracks = list(track.height = 0.001)
+)
+
+# Add barplot track
+circos.track(ylim = c(0, max(set_sizes_df$n) * 1.1),
+             bg.border = NA,
+             track.height = 0.2,
+             panel.fun = function(x, y) {
+               sector.index = get.cell.meta.data("sector.index")
+               xlim = get.cell.meta.data("xlim")
+               
+               # Get the value for this sector
+               value = set_sizes_df$n[set_sizes_df$celltype == sector.index]
+               
+               # Draw rectangle (bar)
+               circos.rect(xlim[1], 0, xlim[2], value,
+                           col = cell_colors[sector.index],
+                           border = cell_colors[sector.index])
+               
+               # Add text label
+               circos.text(mean(xlim), value + max(set_sizes_df$n) * 0.02,
+                           labels = value,
+                           sector.index = sector.index,
+                           facing = "inside",
+                           niceFacing = TRUE,
+                           cex = 1,
+                           adj = c(0.5, 0))
+             })
+
+# Add y-axis for the barplot
+circos.yaxis(side = "left", 
+             sector.index = cell_types[1],
+             labels.cex = 0.5,
+             at = pretty(c(0, max(set_sizes_df$n)), n = 3))
+
+circos.clear()
+```
+
+```{r echo = F}
+upset_combined_df %>%
+  arrange(desc(lengths(celltype)))
+
+combined_wide <- combined %>%
+  filter(fdr < 0.05) %>%
+  filter(celltype %nin% c("IMMUNE_MYELOID", "IMMUNE_LYMPHOID")) %>%
+  mutate(logFC_direction = case_when(`logFC_treatmentDapagliflozin:visitPOST` < 0 ~ "-",
+                                     `logFC_treatmentDapagliflozin:visitPOST` > 0 ~ "+")) %>%
+  dplyr::select(Gene, celltype, logFC_direction) %>%
+  pivot_wider(
+    names_from = celltype,
+    values_from = logFC_direction,
+    values_fn = list(direction = identity)) %>%
+  rowwise() %>%
+  dplyr::mutate(n_pos = sum(c_across(PT:FIBVSMCP) == "+", na.rm = TRUE),
+                n_neg = sum(c_across(PT:FIBVSMCP) == "-", na.rm = TRUE),
+                n_total = sum(!is.na(c_across(PT:FIBVSMCP)))) %>%
+  ungroup() %>%
+  arrange(desc(n_total))
+
+save(combined_wide, file = "/Users/choiyej/Library/CloudStorage/OneDrive-SharedLibraries-UW/Laura Pyle - Bjornstad/Biostatistics Core Shared Drive/ATTEMPT/Results/model comparison/celltype_deg_concordance.RData")
+
+
+gene_list_4 <- combined_wide %>%
+  filter(n_total >= 4) %>%
+  pull(Gene)
+
+save(gene_list_4, file = "/Users/choiyej/Library/CloudStorage/OneDrive-SharedLibraries-UW/Laura Pyle - Bjornstad/Biostatistics Core Shared Drive/ATTEMPT/Results/model comparison/gene_list_greater_than_3.RData")
+
+```
+
+## IPA pathway results
+
+```{r echo = F}
+# read in all the results by looping through cell types
+names(celltype_groups)
+
+for (cell in names(celltype_groups)){
+  ipa_res <- read_excel(paste0("/Users/choiyej/Library/CloudStorage/OneDrive-SharedLibraries-UW/Laura Pyle - Bjornstad/Biostatistics Core Shared Drive/ATTEMPT/Results/IPA/kpmp/nebula/full ", tolower(cell), "_kpmp_DiD.xls"), skip = 1)
+  colnames(ipa_res) <- c("pathway", "neg_log_p", "ratio", "z", "genes")
+  var_name = paste0(tolower(cell), "_kpmp_ipa")
+  assign(var_name, ipa_res, envir = .GlobalEnv)
+}
+```
+
+
+```{r echo = F}
+for (cell in names(celltype_groups)) {
+  df <- get(paste0(tolower(cell), "_kpmp_ipa"))
+  
+  df_top <- df %>%
+    arrange(desc(neg_log_p)) %>%
+    filter(!is.na(z)) %>%
+    head(20) %>%
+    mutate(pathway = shorten_pathway_names(pathway, max_length = 70))
+  
+  df_top$pathway <- factor(df_top$pathway, 
+                                    levels = rev(df_top$pathway))
+  
+  df_top %>%
+    ggplot(aes(y = pathway, x = neg_log_p, fill = z)) +
+    geom_col(width = 0.9) + 
+    geom_vline(xintercept = -log10(0.05), linetype = "dashed", color = "#aaaaaa") +
+    geom_text(label = df_top$pathway, 
+              x = -log10(0.05)+0.1, hjust = 0, 
+              fontface = "bold", family = "Arial",
+              color = "#2b2b2b") +
+    scale_fill_gradient2(low = "#89c2d9", mid = "white", high = "#ee7674", midpoint = 0) +
+    theme_minimal() +
+    theme(panel.grid = element_blank(), legend.position = "top",
+          axis.text.y = element_blank(),
+          legend.title = element_text(vjust = 0.8))  +
+    labs(y = NULL, x = "-log(p-value)", fill = "Z-score",
+         caption = paste0("Cell type: ", gsub("_", " ", cell))) +
+    scale_x_continuous(
+      expand = expansion(mult = c(0, 0)))
+  
+  ggsave(paste0("/Users/choiyej/Library/CloudStorage/OneDrive-SharedLibraries-UW/Laura Pyle - Bjornstad/Biostatistics Core Shared Drive/ATTEMPT/Results/Figures/Pathways/nebula/kpmp/full_", tolower(cell), "_ipa.png"))
+}
+```
+# GSEA
+
+```{r echo = F}
+# GSEA with full gene set model (not HVG)
+for (cell in names(celltype_groups)) {
+  df <- get(paste0(tolower(cell), "_kpmp"))
+  
+  gsea_list <- run_fgsea_analysis(results_annotated = df,
+                                stat_col = "logFC_treatmentDapagliflozin:visitPOST",
+                                gene_col = "Gene",
+                                nPermSimple = 100000,
+                                references = c("hallmark", "reactome", "go", "full"))
+  
+  saveRDS(gsea_list, paste0("/Users/choiyej/Library/CloudStorage/OneDrive-SharedLibraries-UW/Laura Pyle - Bjornstad/Biostatistics Core Shared Drive/ATTEMPT/Results/GSEA/full_", tolower(cell), "_gsea.RDS"))
+  
+}
+
+for (cell in names(celltype_groups)) {
+  rdsfile <- readRDS(paste0("/Users/choiyej/Library/CloudStorage/OneDrive-SharedLibraries-UW/Laura Pyle - Bjornstad/Biostatistics Core Shared Drive/ATTEMPT/Results/GSEA/full_", tolower(cell), "_gsea.RDS"))
+  hallmark_file <- rdsfile$hallmark %>%
+    dplyr::select(-leadingEdge)
+  write.csv(hallmark_file, paste0("/Users/choiyej/Library/CloudStorage/OneDrive-SharedLibraries-UW/Laura Pyle - Bjornstad/Biostatistics Core Shared Drive/ATTEMPT/Results/GSEA/hallmark_", tolower(cell), "_gsea.csv"), row.names = F, na = "")
+}
+
+```

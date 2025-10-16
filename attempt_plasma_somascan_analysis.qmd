@@ -1,0 +1,1011 @@
+---
+title: "ATTEMPT Plasma SOMA Scan Analysis"
+author: "Ye Ji Choi and Laura Pyle"
+date: "`r lubridate::today()`"
+format: 
+  html:
+    toc: true
+    toc-depth: 5
+    toc-location: left
+    code-fold: true
+    embed-resources: true
+    message: false
+    warning: false
+---
+
+```{r echo = F, include = F}
+library(jsonlite)
+library(aws.s3)
+library(dplyr)
+library(ggplot2)
+library(knitr)
+library(ensr)
+library(kableExtra)
+library(ggrepel)
+library(purrr)
+library(tidyverse)
+library(limma)
+library(arsenal)
+library(fgsea)
+library(correlation)
+library(psych)
+library(openxlsx)
+library(SomaPlotr)
+library(lme4)
+library(lmerTest)
+
+# specify user for paths
+user <- Sys.info()[["user"]]
+
+if (user == "choiyej") {
+  root_path <- "/Users/choiyej/Library/CloudStorage/OneDrive-SharedLibraries-UW/Laura Pyle - Bjornstad/Biostatistics Core Shared Drive/"
+  git_path <- "/Users/choiyej/GitHub/CHCO-Code/Petter Bjornstad/"
+} else if (user == "pylell") {
+  root_path <- "/Users/pylell/Library/CloudStorage/OneDrive-SharedLibraries-UW/Bjornstad/Biostatistics Core Shared Drive/"
+  git_path <- "/Users/pylell/Documents/GitHub/CHCO-Code/Petter Bjornstad/"
+} else {
+  stop("Unknown user: please specify root path for this user.")
+}
+
+source(file.path(git_path, "ATTEMPT/attempt_functions.R"))
+source(file.path(git_path, "Resources/YC/R Functions/correlation_function.R"))
+
+bg_path <- file.path(root_path, "GSEA/")
+load(file.path(root_path, "KNIGHT/Somalogic data/analytes.Rdata"))
+
+# load urine creatinine
+urine_creat <- read.xlsx(file.path(root_path, 'ATTEMPT/Data Raw/Urine Proteomics Sample Manifest Jun 25 2025.xlsx'), sheet = "Working")
+names(urine_creat) <- c("position", "record_id", "visit", "box", "creatinine_u_proteomics", "comments")
+# SOMA analytes names/info
+load(file.path(root_path, "Data Harmonization/Combined SomaScan/analytes_2.Rdata"))
+
+```
+
+```{r include = F}
+## Create an S3 client
+keys <- fromJSON("/Users/choiyej/Library/CloudStorage/OneDrive-TheUniversityofColoradoDenver/Bjornstad Pyle Lab/keys.json")
+
+Sys.setenv(
+  "AWS_ACCESS_KEY_ID" = keys$MY_ACCESS_KEY,
+  "AWS_SECRET_ACCESS_KEY" = keys$MY_SECRET_KEY,
+  "AWS_DEFAULT_REGION" = "",
+  "AWS_REGION" = "",
+  "AWS_S3_ENDPOINT" = "s3.kopah.uw.edu"
+)
+```
+
+
+```{r echo = F}
+harm_dat_raw <- read.csv(file.path(root_path, "Data Harmonization/Data Clean/soma_harmonized_dataset.csv"), na.strings = "") 
+
+attempt_redcap <- harm_dat_raw %>% filter(study == "ATTEMPT") %>%
+  dplyr::summarise(across(where(negate(is.numeric)), ~ ifelse(all(is.na(.x)), NA_character_, last(na.omit(.x)))),
+                   across(where(is.numeric), ~ ifelse(all(is.na(.x)), NA_real_, mean(.x, na.rm = TRUE))),
+                   .by = c(record_id, visit)) %>%
+  dplyr::mutate(race_ethnicity_condensed = case_when(race == "White" &
+                                                       ethnicity == "Not Hispanic or Latino" ~ "Not Hispanic or Latino White",
+                                                     race == "Black or African American" &
+                                                       ethnicity == "Not Hispanic or Latino" ~ "Not Hispanic or Latino Black",
+                                                     ethnicity == "Hispanic or Latino" ~ "Hispanic or Latino",
+                                                     T ~ "Not Hispanic or Latino Other")) %>%
+  arrange(record_id) %>%
+  dplyr::select(-hba1c, -starts_with("seq."))
+
+attempt_redcap_denver <- attempt_redcap %>%
+  filter(grepl("^3", record_id)) %>%
+  mutate(visit = case_when(visit == "baseline" ~ 0,
+                           visit == "4_weeks_post" ~ 4,
+                           visit == "4_months_post" ~ 16,
+                           visit == "screening"  ~ -4,
+                           visit == "follow_up" ~ 18),
+         record_id = as.integer(record_id)) %>%
+  dplyr::select(-c(ethnicity, bmi, gfr_raw_plasma, gfr_bsa_plasma, date, sex, mri_date, PWV,
+                   creatinine_s, cystatin_c_s, temp, pulse, height, avg_c_r2, avg_k_r2, 
+                   sbp, dbp, hct, age, weight)) %>%
+  rowwise() %>%
+  mutate(avg_c_t1 = mean(c(t1_r_cortex, t1_l_cortex), na.rm = T),
+         avg_k_t1 = mean(c(t1_r_kidney, t1_l_kidney), na.rm = T),
+         tkv = (volume_left + volume_right)) %>%
+  ungroup() %>%
+  dplyr::rename(subject_id = record_id)
+
+# clinical dataset from Antoine (merged version)
+attempt_dat <- s3readRDS("Clinical Data/ATTEMPT_AC.RDS", "attempt", region = "")
+attempt_dat[attempt_dat == ""] <- NA
+attempt_dat <- attempt_dat %>%
+  filter(visit %in% c("baseline", "4_weeks_post", "4_months_post", "screening", "follow_up")) %>%
+  mutate(visit = case_when(visit == "baseline" ~ 0,
+                           visit == "4_weeks_post" ~ 4,
+                           visit == "4_months_post" ~ 16,
+                           visit == "screening"  ~ -4,
+                           visit == "follow_up" ~ 18),
+         record_id = as.integer(record_id)) %>%
+  dplyr::rename(subject_id = record_id,
+                treatment = treatment_arm)
+
+# extract IDs with biopsy
+attempt_clean_so_metadata <- s3readRDS("cleaned_data/attempt_clean_so_metadata.rds", "attempt", region = "")
+attempt_biopsy_yn <- attempt_clean_so_metadata %>%
+  dplyr::select(subject_id, visit) %>%
+  distinct(subject_id, visit, .keep_all = T) %>%
+  mutate(visit = case_when(visit == "PRE" ~ 0,
+                           visit == "POST" ~ 16),
+         biopsy_yn = "Yes")
+attempt_biopsy_yn <- attempt_biopsy_yn %>%
+  rbind(attempt_biopsy_yn %>%
+          filter(visit == 0) %>%
+          mutate(visit = -4))
+
+# merge REDCap version (for Denver) and dataset from Antoine
+attempt_dat <- left_join(attempt_dat, attempt_redcap_denver) %>%
+  left_join(attempt_biopsy_yn) %>%
+  mutate(biopsy_yn = case_when(biopsy_yn == "Yes" ~ "Yes",
+                               T ~ "No"))
+attempt_dat$treatment <- factor(attempt_dat$treatment, levels = c("Placebo", "Dapagliflozin 5mg"))
+```
+
+```{r echo = F}
+harm_dat <- harm_dat_raw %>%
+  filter(study == "ATTEMPT") %>%
+  dplyr::summarise(across(where(negate(is.numeric)), ~ ifelse(all(is.na(.x)), NA_character_, last(na.omit(.x)))),
+                   across(where(is.numeric), ~ ifelse(all(is.na(.x)), NA_real_, mean(.x, na.rm = TRUE))),
+                   .by = c(record_id, visit)) %>%
+  mutate(visit = case_when(visit == "baseline" ~ 0,
+                           visit == "4_weeks_post" ~ 4,
+                           visit == "4_months_post" ~ 16,
+                           visit == "screening"  ~ -4,
+                           visit == "follow_up" ~ 18),
+         record_id_visit = paste0(record_id, "_", visit),
+         treatment_arm = case_when(treatment_arm == "Placebo" ~ "Placebo",
+                                   T ~ "Dapagliflozin")) %>%
+  filter(visit %in% c(0, 16))
+
+# load SOMA and exclude the 5 with mix up
+soma <- harm_dat %>%
+  filter(!is.na(seq.10030.8)) %>%
+  filter(urine_creat_proteomics > 1) # filtering out those with extremely low creatinine (mix up with serum)
+
+soma$visit <- factor(soma$visit, levels = c(0, 16), label = c("PRE", "POST"))
+```
+
+# SOMA
+
+```{r echo = F, results='asis'}
+summary(arsenal::tableby(visit ~ age + sex + bmi + diabetes_duration, 
+                         data = soma, strata = treatment_arm), test = F, 
+        labelTranslations = c("age" = "Age", "sex" = "Sex", "acr_u" = "UACR", 
+                              "bmi" = "BMI", "diabetes_duration" = "Diabetes duration"))
+```
+
+## Placebo
+```{r echo = F}
+placebo_res_plasma <- run_limma_proteomics(data = soma,
+                                           analyte_info = analytes_attempt,
+                                           treatment = "Placebo",
+                                           feature_suffix = "",
+                                           model_type = "within_treatment")
+```
+
+```{r echo = F}
+plot_volcano_proteomics(data = placebo_res_plasma$results_annotated, fc = "logFC",
+                        p_col = "P.Value",
+                        title = NULL,
+                        x_axis = "LogFC", 
+                        y_axis = "-log10(p-value)",
+                        positive_text = "Positive after placebo treatment",
+                        negative_text = "Negative after placebo treatment",
+                        formula = "visit",
+                        file_suffix = "_placebo_plasma_proteomics")
+plot_volcano_proteomics(data = placebo_res_plasma$results_annotated, fc = "logFC",
+                        p_col = "adj.P.Val",
+                        title = NULL,
+                        x_axis = "LogFC", 
+                        y_axis = "-log10(adj.p-value)",
+                        positive_text = "Positive after placebo treatment",
+                        negative_text = "Negative after placebo treatment",
+                        formula = "visit",
+                        file_suffix = "_placebo_plasma_proteomics_adjp")
+```
+
+## Dapagliflozin
+```{r echo = F}
+dapa_res_plasma <- run_limma_proteomics(data = soma,
+                                        analyte_info = analytes_attempt,
+                                        treatment = "Dapagliflozin",
+                                        feature_suffix = "",
+                                        model_type = "within_treatment")
+```
+
+```{r echo = F}
+plot_volcano_proteomics(data = dapa_res_plasma$results_annotated, fc = "logFC",
+                        p_col = "P.Value",
+                        title = NULL,
+                        x_axis = "LogFC", 
+                        y_axis = "-log10(p-value)",
+                        positive_text = "Positive after dapagliflozin treatment",
+                        negative_text = "Negative after dapagliflozin treatment",
+                        formula = "visit",
+                        file_suffix = "_dapa_plasma_proteomics")
+plot_volcano_proteomics(data = dapa_res_plasma$results_annotated, fc = "logFC",
+                        p_col = "adj.P.Val",
+                        title = NULL,
+                        x_axis = "LogFC", 
+                        y_axis = "-log10(adj.p-value)",
+                        positive_text = "Positive after dapagliflozin treatment",
+                        negative_text = "Negative after dapagliflozin treatment",
+                        formula = "visit",
+                        file_suffix = "_dapa_plasma_proteomics_adjp")
+```
+
+## PRE (Placebo vs. Dapa)
+```{r echo = F}
+pre_res_plasma <- run_limma_proteomics(data = soma,
+                                       analyte_info = analytes_attempt,
+                                       visit = "PRE",
+                                       feature_suffix = "",
+                                       model_type = "within_visit")
+```
+
+```{r echo = F}
+plot_volcano_proteomics(data = pre_res_plasma$results_annotated, fc = "logFC",
+                        p_col = "P.Value",
+                        title = NULL,
+                        x_axis = "LogFC", 
+                        y_axis = "-log10(p-value)",
+                        positive_text = "Positive in dapagliflozin\ncompared to placebo (at baseline)",
+                        negative_text = "Negative in dapagliflozin\ncompared to placebo (at baseline)",
+                        formula = "treatment",
+                        file_suffix = "_pre_plasma_proteomics")
+plot_volcano_proteomics(data = pre_res_plasma$results_annotated, fc = "logFC",
+                        p_col = "adj.P.Val",
+                        title = NULL,
+                        x_axis = "LogFC", 
+                        y_axis = "-log10(adj.p-value)",
+                        positive_text = "Positive in dapagliflozin\ncompared to placebo (at baseline)",
+                        negative_text = "Negative in dapagliflozin\ncompared to placebo (at baseline)",
+                        formula = "treatment",
+                        file_suffix = "_pre_plasma_proteomics_adjp")
+```
+
+## POST (Placebo vs. Dapa)
+```{r echo = F}
+post_res_plasma <- run_limma_proteomics(data = soma,
+                                        analyte_info = analytes_attempt,
+                                        visit = "POST",
+                                        feature_suffix = "",
+                                        model_type = "within_visit")
+```
+
+```{r echo = F}
+plot_volcano_proteomics(data = post_res_plasma$results_annotated, fc = "logFC",
+                        p_col = "P.Value",
+                        title = NULL,
+                        x_axis = "LogFC", 
+                        y_axis = "-log10(p-value)",
+                        positive_text = "Positive in dapagliflozin\ncompared to placebo (at follow-up)",
+                        negative_text = "Negative in dapagliflozin\ncompared to placebo (at follow-up)",
+                        formula = "treatment",
+                        file_suffix = "_post_plasma_proteomics")
+plot_volcano_proteomics(data = post_res_plasma$results_annotated, fc = "logFC",
+                        p_col = "adj.P.Val",
+                        title = NULL,
+                        x_axis = "LogFC", 
+                        y_axis = "-log10(adj.p-value)",
+                        positive_text = "Positive in dapagliflozin\ncompared to placebo (at follow-up)",
+                        negative_text = "Negative in dapagliflozin\ncompared to placebo (at follow-up)",
+                        formula = "treatment",
+                        file_suffix = "_post_plasma_proteomics_adjp")
+```
+
+# DiD
+```{r echo = F}
+# using creatinine adjusted proteins
+did_res_plasma <- run_limma_proteomics(data = soma,
+                                       analyte_info = analytes_attempt,
+                                       feature_suffix = "",
+                                       model_type = "interaction")
+
+did_res_plasma_mixed <- run_limma_proteomics(data = soma,
+                                             analyte_info = analytes_attempt,
+                                             feature_suffix = "",
+                                             model_type = "interaction_random")
+# 6 out of 7289 singularity warning (0.1%)
+s3saveRDS(did_res_plasma_mixed, "Proteomics/plasma_proteomics_res.RDS", "attempt", region = "")
+write.csv(did_res_plasma_mixed$results_annotated, file.path(root_path, "ATTEMPT/Results/Somascan/plasma_proteomics_res.csv"), row.names = F)
+```
+
+```{r echo = F}
+plot_volcano_proteomics(data = did_res_plasma$results_annotated, 
+                        fc = "logFC",
+                        p_col = "P.Value",
+                        title = NULL,
+                        x_axis = "LogFC", 
+                        y_axis = "-log10(p-value)",
+                        positive_text = "Positive DiD",
+                        negative_text = "Negative DiD",
+                        formula = "treatment:visit",
+                        file_suffix = "_DiD_plasma_proteomics")
+
+plot_volcano_proteomics(data = did_res_plasma$results_annotated, 
+                        fc = "logFC",
+                        p_col = "adj.P.Val",
+                        title = NULL,
+                        x_axis = "LogFC", 
+                        y_axis = "-log10(adj.p-value)",
+                        positive_text = "Positive DiD",
+                        negative_text = "Negative DiD",
+                        formula = "treatment:visit",
+                        file_suffix = "_DiD_plasma_proteomics_adjp")
+
+plot_volcano_proteomics(data = did_res_plasma_mixed$results_annotated, 
+                        fc = "logFC",
+                        p_col = "P.Value",
+                        title = NULL,
+                        x_axis = "LogFC", 
+                        y_axis = "-log10(p-value)",
+                        positive_text = "Positive DiD",
+                        negative_text = "Negative DiD",
+                        formula = "treatment:visit + (1|subject)",
+                        file_suffix = "_DiD_plasma_proteomics_mixed")
+
+plasma_volcano <- plot_volcano_proteomics(data = did_res_plasma_mixed$results_annotated, 
+                        fc = "logFC",
+                        p_col = "adj.P.Val",
+                        title = NULL,
+                        x_axis = "LogFC", 
+                        y_axis = "-log10(adj.p-value)",
+                        positive_text = "Positive DiD",
+                        negative_text = "Negative DiD",
+                        formula = "treatment:visit + (1|subject)",
+                        file_suffix = "_DiD_plasma_proteomics_adjp_mixed")
+```
+
+```{r echo = F}
+# DiD heatmap
+res_full_wide <- did_res_plasma_mixed$results_full %>%
+  dplyr::select(-effect) %>%
+  # Pivot wider, creating columns for each term's statistics
+  tidyr::pivot_wider(
+    id_cols = c(AptName, SeqId, EntrezGeneSymbol, Target),  # Keep these as row identifiers
+    names_from = term,
+    values_from = c(logFC, std.error, statistic, df, P.Value, adj.P.Val),
+    names_glue = "{term}_{.value}"  # Format: term_statistic
+  ) %>%
+  mutate(EntrezGeneSymbol = case_when(EntrezGeneSymbol == "" ~ Target, T ~ EntrezGeneSymbol),
+         Gene_seq = paste0(EntrezGeneSymbol, " (", SeqId, ")")) %>%
+  filter(`treatment_armDapagliflozin:visitPOST_P.Value` < 0.05)
+
+plasma_heatmap <- plot_treatment_heatmap(data = res_full_wide,
+                       p_col = "P.Value",
+                       top_n = 20,
+                       logfc_col = "treatment_armDapagliflozin:visitPOST_logFC",
+                       fdr_col = "treatment_armDapagliflozin:visitPOST_adj.P.Val",
+                       logfc_visit = "visitPOST_logFC",
+                       gene_col = "Gene_seq",
+                       heatmap_caption = F)
+
+ggarrange(plasma_volcano, plasma_heatmap, widths = c(2,1), labels = "AUTO")
+ggsave(file.path(root_path, "ATTEMPT/Results/Figures/Panels/plasma_proteomics_panel.png"), width = 10, height = 6)
+```
+## GSEA (fgsea)
+
+```{r echo = F}
+soma_DiD_fgsea <- run_fgsea_analysis(bg_path = bg_path,
+                                     results_annotated = did_res_plasma_mixed$results_annotated,
+                                     stat_col = "statistic")
+soma_DiD_fgsea$summary
+```
+
+```{r echo = F}
+# KEGG
+plot_fgsea_transpose(soma_DiD_fgsea$kegg, 
+                     title = "SOMA DiD Top 30 KEGG",
+                     xmax = 30)
+ggsave(file.path(root_path, "ATTEMPT/Results/Figures/Proteomics/Pathways/plasma_SOMA_DiD_KEGG.png"),
+       width = 27.5, height = 14, scale = 1)
+# REACTOME
+plot_fgsea_transpose(soma_DiD_fgsea$reactome, 
+                     title = "SOMA DiD Top 30 REACTOME", 
+                     xmax = 30)
+ggsave(file.path(root_path, "ATTEMPT/Results/Figures/Proteomics/Pathways/plasma_SOMA_DiD_REACTOME.png"),
+       width = 27.5, height = 14, scale = 1)
+# GO
+plot_fgsea_transpose(soma_DiD_fgsea$go, 
+                     title = "SOMA DiD Top 30 GO", 
+                     xmax = 30)
+ggsave(file.path(root_path, "ATTEMPT/Results/Figures/Proteomics/Pathways/plasma_SOMA_DiD_GO.png"),
+       width = 27.5, height = 14, scale = 1)
+```
+
+## Integrate transcriptomics
+
+```{r echo = F}
+# read in results from transcriptomics (EC, POD, MES, VSMC, Immune) for plasma proteimics)
+celltypes <- c("EC", "POD", "FIB/VSMC/P", "Immune")
+
+# Full gene set (not limited to 2000 HVG)
+for (cell in celltypes)  {
+  input_path <- paste0(cell,"/nebula/",tolower(cell),"_attempt_nebula_res_reml_pooled.rds")
+  cell_df <- s3readRDS(input_path, bucket = "attempt", region = "")
+  head(cell_df)
+  processed <- process_nebula_results(cell_df)
+  lower_cell <- tolower(cell)
+  var_name <- paste0(lower_cell, "_nebula_res_combined_reml_pooled")
+  
+  assign(var_name, processed$results)
+}
+
+plasma_did_sig <- did_res_plasma_mixed$results_annotated %>%
+  filter(P.Value < 0.05)
+
+plasma_delta <- soma %>%
+  select(record_id, visit, treatment_arm, starts_with(pt_map$AptName) & ends_with("cradj")) %>%
+  pivot_wider(
+    names_from = visit,
+    values_from = starts_with("seq"),
+    names_glue = "{.value}_{visit}"
+  ) %>%
+  mutate(across(ends_with("_POST"), 
+                ~ . - get(sub("_POST$", "_PRE", cur_column())),
+                .names = "delta_{.col}")) %>%
+  select(record_id, treatment_arm, starts_with("delta_"))
+
+s3saveRDS(plasma_delta, "Proteomics/plasma_cradj_proteomics_delta.RDS", "attempt", region = "")
+```
+
+```{r echo = F}
+# create mapping table for each celltype
+
+walk(celltypes, function(ct) {
+  
+  # Dynamically get the nebula results object based on cell type
+  nebula_obj <- get(paste0(tolower(ct), "_nebula_res_combined_reml_pooled"))
+  
+  sig <- nebula_obj %>%
+    filter(`p_treatmentDapagliflozin:visitPOST` < 0.05)
+  
+  map <- analytes_info %>%
+    filter(EntrezGeneSymbol %in% unique(sig$Gene[sig$Gene %in% plasma_did_sig$EntrezGeneSymbol])) %>%
+    select(Target, TargetFullName, AptName, EntrezGeneSymbol)
+  
+  write.csv(map, 
+            file.path(root_path, paste0("ATTEMPT/Results/Somascan/", ct, "_plasma_proteomics_map.csv")), 
+            row.names = FALSE, na = "")
+})
+```
+
+## Correlations with clinical variables
+
+### mGFR
+
+```{r echo = F, warning=FALSE, quiet = TRUE}
+# mGFR 
+plasma_soma_mgfr <- soma_corr(
+  clinical_raw = attempt_dat,
+  soma_raw     = soma,
+  did_df       = did_res_plasma_mixed$results_annotated,
+  analytes_info= analytes_attempt,
+  clinical_var = "mgfr_jodal",
+  feature_suffix = "",
+  proper_name = "\u0394 mGFR",
+  pre_visit = -4
+)
+
+# correlation table
+plasma_soma_mgfr$correlation_table
+
+# plots
+plasma_soma_mgfr$plot_all
+ggsave(file.path(root_path, "ATTEMPT/Results/Figures/Proteomics/Volcano Plots/Correlations/volcano_mixed_spearman_plasma_mgfr.png"),
+       plasma_soma_mgfr$plot_all, width = 10, height = 7)
+```
+
+### mGFR adjusted
+
+```{r echo = F, warning=FALSE}
+plasma_soma_mgfr_adj <- soma_corr(
+  clinical_raw = attempt_dat,
+  soma_raw     = soma,
+  did_df       = did_res_plasma_mixed$results_annotated,
+  analytes_info= analytes_attempt,
+  clinical_var = "mgfr_jodal_bsa",
+  feature_suffix = "",
+  proper_name = "\u0394 mGFR (BSA)",
+  pre_visit = -4
+)
+
+# correlation table
+plasma_soma_mgfr_adj$correlation_table
+
+# plots
+plasma_soma_mgfr_adj$plot_all
+ggsave(file.path(root_path, "ATTEMPT/Results/Figures/Proteomics/Volcano Plots/Correlations/volcano_mixed_spearman_plasma_mgfr_bsa.png"),
+       plasma_soma_mgfr_adj$plot_all, width = 10, height = 7)
+```
+
+### HbA1c
+
+```{r echo = F, warning=FALSE}
+plasma_soma_hba1c <- soma_corr(
+  clinical_raw = attempt_dat,
+  soma_raw     = soma,
+  did_df       = did_res_plasma_mixed$results_annotated,
+  analytes_info= analytes_attempt,
+  clinical_var = "hba1c",
+  feature_suffix = "",
+  proper_name = "\u0394 HbA1c"
+)
+
+# correlation table
+plasma_soma_hba1c$correlation_table
+
+# plots
+plasma_soma_hba1c$plot_all
+ggsave(file.path(root_path, "ATTEMPT/Results/Figures/Proteomics/Volcano Plots/Correlations/volcano_mixed_spearman_plasma_hba1c.png"),
+       plasma_soma_hba1c$plot_all, width = 10, height = 7)
+```
+
+### TIR
+
+```{r echo = F, warning=FALSE}
+plasma_soma_tir <- soma_corr(
+  clinical_raw = attempt_dat,
+  soma_raw     = soma,
+  did_df       = did_res_plasma_mixed$results_annotated,
+  analytes_info= analytes_attempt,
+  clinical_var = "cgm_tir",
+  feature_suffix = "",
+  proper_name = "\u0394 TIR"
+)
+
+# correlation table
+plasma_soma_tir$correlation_table
+
+# plots
+plasma_soma_tir$plot_all
+ggsave(file.path(root_path, "ATTEMPT/Results/Figures/Proteomics/Volcano Plots/Correlations/volcano_mixed_spearman_plasma_tir.png"),
+       plasma_soma_tir$plot_all, width = 10, height = 7)
+```
+
+### Weight
+
+```{r echo = F, warning=FALSE}
+plasma_soma_weight <- soma_corr(
+  clinical_raw = attempt_dat,
+  soma_raw     = soma,
+  did_df       = did_res_plasma_mixed$results_annotated,
+  analytes_info= analytes_attempt,
+  clinical_var = "weight",
+  feature_suffix = "",
+  proper_name = "\u0394 Weight"
+)
+
+# correlation table
+plasma_soma_weight$correlation_table
+
+# plots
+plasma_soma_weight$plot_all
+ggsave(file.path(root_path, "ATTEMPT/Results/Figures/Proteomics/Volcano Plots/Correlations/volcano_mixed_spearman_plasma_weight.png"),
+       plasma_soma_weight$plot_all, width = 10, height = 7)
+```
+
+### PWV
+
+```{r echo = F, warning=FALSE}
+plasma_soma_PWV <- soma_corr(
+  clinical_raw = attempt_dat,
+  soma_raw     = soma,
+  did_df       = did_res_plasma_mixed$results_annotated,
+  analytes_info= analytes_attempt,
+  clinical_var = "PWV",
+  feature_suffix = "",
+  proper_name = "\u0394 PWV",
+  pre_visit = -4
+)
+
+# correlation table
+plasma_soma_PWV$correlation_table
+
+# plots
+plasma_soma_PWV$plot_all
+ggsave(file.path(root_path, "ATTEMPT/Results/Figures/Proteomics/Volcano Plots/Correlations/volcano_mixed_spearman_plasma_PWV.png"),
+       plasma_soma_PWV$plot_all, width = 10, height = 7)
+```
+
+### Cortical R2*
+
+```{r echo = F, warning=FALSE}
+plasma_soma_avg_c_r2 <- soma_corr(
+  clinical_raw = attempt_dat,
+  soma_raw     = soma,
+  did_df       = did_res_plasma_mixed$results_annotated,
+  analytes_info= analytes_attempt,
+  clinical_var = "avg_c_r2",
+  feature_suffix = "",
+  proper_name = "\u0394 Cortical R2*",
+  pre_visit = -4
+)
+
+# correlation table
+plasma_soma_avg_c_r2$correlation_table
+
+# plots
+plasma_soma_avg_c_r2$plot_all
+ggsave(file.path(root_path, "ATTEMPT/Results/Figures/Proteomics/Volcano Plots/Correlations/volcano_mixed_spearman_plasma_avg_c_r2.png"),
+       plasma_soma_avg_c_r2$plot_all, width = 10, height = 7)
+```
+
+### Kidney R2*
+
+```{r echo = F, warning=FALSE}
+plasma_soma_avg_k_r2 <- soma_corr(
+  clinical_raw = attempt_dat,
+  soma_raw     = soma,
+  did_df       = did_res_plasma_mixed$results_annotated,
+  analytes_info= analytes_attempt,
+  clinical_var = "avg_k_r2",
+  feature_suffix = "",
+  proper_name = "\u0394 Kidney R2*",
+  pre_visit = -4
+)
+
+# correlation table
+plasma_soma_avg_k_r2$correlation_table
+
+# plots
+plasma_soma_avg_k_r2$plot_all
+ggsave(file.path(root_path, "ATTEMPT/Results/Figures/Proteomics/Volcano Plots/Correlations/volcano_mixed_spearman_plasma_avg_k_r2.png"),
+       plasma_soma_avg_k_r2$plot_all, width = 10, height = 7)
+```
+
+```{r echo = F}
+# # write correlation results to file
+# wb <- createWorkbook()
+# addWorksheet(wb,"Change in mgfr_si")
+# writeData(wb,"Change in mgfr_si",corr_delta_mgfr_si_mat,rowNames = F)
+# addWorksheet(wb,"Change in mgfr_si_adjusted")
+# writeData(wb,"Change in mgfr_si_adjusted",corr_delta_mgfr_si_adjusted_mat,rowNames = F)
+# addWorksheet(wb,"Change in HbA1c")
+# writeData(wb,"Change in HbA1c",corr_delta_hba1c_percent_mat,rowNames = F)
+# addWorksheet(wb,"Change in PWV")
+# writeData(wb,"Change in PWV",corr_delta_PWV_mat,rowNames = F)
+# 
+# saveWorkbook(wb,file.path(root_path, "ATTEMPT/Results/Somascan/Somascan_clinical_correlations.xlsx"),overwrite = TRUE)
+```
+
+# Integration with scRNA (results from Hyak)
+
+```{r include = F}
+celltype_groups <- list(
+  PT = c("PT-S1/S2", "PT-S3", "aPT"),
+  TAL = c("C-TAL-1", "C-TAL-2", "aTAL", "dTAL"),
+  PC = c("CCD-PC", "CNT-PC", "dCCD-PC", "M-PC", "tPC-IC"),
+  EC = c("EC-AVR", "EC-GC", "EC-PTC", "EC-AEA", "EC-LYM", "EC/VSMC"),
+  IC = c("IC-A", "IC-B", "aIC"),
+  Immune = c("MAC", "MON", "cDC", "pDC", "CD4+ T", "CD8+ T", "B", "NK"),
+  Immune_myeloid = c("MAC", "MON", "cDC", "pDC"),
+  Immune_lymphoid = c("CD4+ T", "CD8+ T", "B", "NK"),
+  VSMC_P_FIB = c("VSMC/P", "FIB"),
+  POD = "POD",
+  DCT = c("DCT", "dDCT"),  # Distal convoluted tubule
+  CD = c("CCD-PC", "dCCD-PC", "CNT-PC", "tPC-IC", "MC", "aIC", "IC-A", "IC-B", "CNT"),  # Collecting duct & connecting tubule
+  Glom  = c("POD", "MC", "M-PC"),
+  VSMC        = c("VSMC/P", "EC/VSMC")
+)
+
+# Now add combined group
+celltype_groups$Combined_p <- c(
+  celltype_groups$EC,
+  celltype_groups$Glom,
+  celltype_groups$VSMC,
+  celltype_groups$Immune
+)
+
+## read mixed model results dataframe (rendered in Hyak)
+# process and read all results from ATTEMPT
+# Top 2000 HVG
+for (cell in names(celltype_groups))  {
+  print(paste0("Processing: ", cell))
+  cell <- gsub("/", "_", cell)
+
+  # annotated_df <- read.csv(file.path(root_path, "ATTEMPT/Results/nebula", paste0(tolower(cell), "_kpmp_hvg_res.csv")))
+  # colnames(annotated_df) <- gsub("\\.", ":", colnames(annotated_df))
+  # cell <- gsub("-", "_", cell)
+  # cell <- gsub("\\+\\s", "_", cell)
+  # lower_cell <- tolower(cell)
+  # var_name <- paste0(lower_cell, "_hvg_kpmp")
+  # print(var_name)
+  # assign(var_name, annotated_df)
+  
+    
+  annotated_df <- read.csv(file.path(root_path, "ATTEMPT/Results/nebula", paste0(tolower(cell), "_kpmp_res.csv")))
+  colnames(annotated_df) <- gsub("\\.", ":", colnames(annotated_df))
+  cell <- gsub("-", "_", cell)
+  cell <- gsub("\\+\\s", "_", cell)
+  lower_cell <- tolower(cell)
+  var_name <- paste0(lower_cell, "_kpmp")
+  print(var_name)
+  assign(var_name, annotated_df)
+}
+# 
+# for (cell in unlist(celltype_groups))  {
+#   print(paste0("Processing: ", cell))
+#   cell <- gsub("/", "_", cell)
+#   cell <- gsub("-", "_", cell)
+#   cell <- gsub("\\+\\s", "_", cell)
+#   
+#   annotated_df <- read.csv(file.path(root_path, "ATTEMPT/Results/nebula", paste0(tolower(cell), "_kpmp_hvg_res.csv")))
+#   colnames(annotated_df) <- gsub("\\.", ":", colnames(annotated_df))
+#   cell <- gsub("-", "_", cell)
+#   cell <- gsub("\\+\\s", "_", cell)
+#   lower_cell <- tolower(cell)
+#   var_name <- paste0(lower_cell, "_hvg_kpmp")
+#   print(var_name)
+#   assign(var_name, annotated_df)
+# 
+# }
+```
+
+
+```{r echo = F}
+vsmc_plasma_raw <- s3readRDS("Proteomics/vsmc_nebula_plasma_soma_res_kpmp.rds", "attempt", region = "")
+vsmc_plasma <- process_nebula_results(vsmc_plasma_raw$results, pval_col = "p_log2(protein)")$results
+vsmc_plasma <- vsmc_plasma %>%
+  mutate(Gene = sub("_.*", "", Gene))
+```
+
+```{r echo = F}
+plot_volcano(vsmc_plasma, 
+             fc = "logFC_log2(protein)", 
+             p_col = "p_log2(protein)", 
+             x_axis = "logFC log2(protein)", 
+             y_axis = "-log10(p.value)",
+             file_suffix = "_kpmp_vsmc_plasma",
+             formula = "log2(protein) + treatment", cell_type = "VSMC",
+             positive_text = "Positively associated\nwith transcript",
+             negative_text = "Negatively associated\nwith transcript") + 
+  geom_vline(xintercept = 0, color = "grey", linetype = "dashed", size = 0.2)
+
+create_directional_volcano(
+  rna_data = vsmc_kpmp,
+  protein_data = vsmc_plasma,
+  cell_type_name = "VSMC"
+)
+ggsave(file.path(root_path, "ATTEMPT/Results/Figures/Proteomics/Volcano Plots/plasma_vsmc.png"))
+  
+```
+
+```{r echo = F}
+vsmc_concordance_plasma <- concordance_by_celltype(
+  biofluid_df = vsmc_plasma,
+  scrna_df    = vsmc_kpmp,
+  biofluid_label = "plasma",
+  celltype = "VSMC",
+  out_dir = file.path(root_path, "ATTEMPT/Results/Somascan/Transcript concordance")
+)
+```
+
+
+```{r echo = F}
+glom_plasma_raw <- s3readRDS("Proteomics/glom_nebula_plasma_soma_res_kpmp.rds", "attempt", region = "")
+glom_plasma <- process_nebula_results(glom_plasma_raw$results, pval_col = "p_log2(protein)")$results
+glom_plasma <- glom_plasma %>%
+  mutate(Gene = sub("_.*", "", Gene))
+```
+
+```{r echo = F}
+plot_volcano(glom_plasma, fc = "logFC_log2(protein)", p_col = "p_log2(protein)", x_axis = "logFC log2(protein)", y_axis = "-log10(p.value)", 
+             file_suffix = "_kpmp_glom_plasma",
+             formula = "log2(protein) + treatment", cell_type = "Glomerular cells",
+             positive_text = "Positively associated\nwith transcript",
+             negative_text = "Negatively associated\nwith transcript") + 
+  geom_vline(xintercept = 0, color = "grey", linetype = "dashed", size = 0.2)
+
+create_directional_volcano(
+  rna_data = glom_kpmp,
+  protein_data = glom_plasma,
+  cell_type_name = "Glomerulus"
+)
+ggsave(file.path(root_path, "ATTEMPT/Results/Figures/Proteomics/Volcano Plots/plasma_glom.png"))
+```
+
+```{r echo = F}
+glom_concordance_plasma <- concordance_by_celltype(
+  biofluid_df = glom_plasma,
+  scrna_df    = glom_kpmp,
+  biofluid_label = "plasma",
+  celltype = "Glom",
+  out_dir = file.path(root_path, "ATTEMPT/Results/Somascan/Transcript concordance")
+)
+```
+
+```{r echo = F}
+immune_plasma_raw <- s3readRDS("Proteomics/immune_nebula_plasma_soma_res_kpmp.rds", "attempt", region = "")
+immune_plasma <- process_nebula_results(immune_plasma_raw$results, pval_col = "p_log2(protein)")$results
+immune_plasma <- immune_plasma %>%
+  mutate(Gene = sub("_.*", "", Gene))
+```
+
+```{r echo = F}
+plot_volcano(immune_plasma, fc = "logFC_log2(protein)", p_col = "p_log2(protein)", x_axis = "logFC log2(protein)", y_axis = "-log10(p.value)", file_suffix = "_kpmp_immune_plasma",
+             formula = "log2(protein) + treatment", cell_type = "Immune",
+             positive_text = "Positively associated\nwith transcript",
+             negative_text = "Negatively associated\nwith transcript") + 
+  geom_vline(xintercept = 0, color = "grey", linetype = "dashed", size = 0.2)
+
+create_directional_volcano(
+  rna_data = immune_kpmp,
+  protein_data = immune_plasma %>% filter(`logFC_log2(protein)` > -10),
+  cell_type_name = "Immune"
+)
+ggsave(file.path(root_path, "ATTEMPT/Results/Figures/Proteomics/Volcano Plots/plasma_immune.png"))
+```
+
+```{r echo = F}
+immune_concordance_plasma <- concordance_by_celltype(
+  biofluid_df = immune_plasma,
+  scrna_df    = immune_kpmp,
+  biofluid_label = "plasma",
+  celltype = "Immune",
+  out_dir = file.path(root_path, "ATTEMPT/Results/Somascan/Transcript concordance")
+)
+```
+
+```{r echo = F}
+ec_plasma_raw <- s3readRDS("Proteomics/ec_nebula_plasma_soma_res_kpmp.rds", "attempt", region = "")
+ec_plasma <- process_nebula_results(ec_plasma_raw$results, pval_col = "p_log2(protein)")$results
+ec_plasma <- ec_plasma %>%
+  mutate(Gene = sub("_.*", "", Gene))
+```
+
+```{r echo = F}
+plot_volcano(ec_plasma, fc = "logFC_log2(protein)", p_col = "p_log2(protein)", x_axis = "logFC log2(protein)", y_axis = "-log10(p.value)", 
+             file_suffix = "_kpmp_ec_plasma",
+             formula = "log2(protein) + treatment", cell_type = "EC",
+             positive_text = "Positively associated\nwith transcript",
+             negative_text = "Negatively associated\nwith transcript") + 
+  geom_vline(xintercept = 0, color = "grey", linetype = "dashed", size = 0.2)
+
+create_directional_volcano(
+  rna_data = ec_kpmp,
+  protein_data = ec_plasma %>% filter(`logFC_log2(protein)` > -10),
+  cell_type_name = "EC"
+)
+ggsave(file.path(root_path, "ATTEMPT/Results/Figures/Proteomics/Volcano Plots/plasma_ec.png"))
+```
+
+```{r echo = F}
+ec_concordance_plasma <- concordance_by_celltype(
+  biofluid_df = ec_plasma,
+  scrna_df    = ec_kpmp,
+  biofluid_label = "plasma",
+  celltype = "EC",
+  out_dir = file.path(root_path, "ATTEMPT/Results/Somascan/Transcript concordance")
+)
+```
+
+```{r combinedho = F}
+combined_plasma_raw <- s3readRDS("Proteomics/combined_nebula_plasma_soma_res_kpmp.rds", "attempt", region = "")
+combined_plasma <- process_nebula_results(combined_plasma_raw$results, pval_col = "p_log2(protein)")$results
+combined_plasma <- combined_plasma %>%
+  mutate(Gene = sub("_.*", "", Gene))
+```
+
+```{r combinedho = F}
+plot_volcano(combined_plasma, fc = "logFC_log2(protein)", p_col = "p_log2(protein)", x_axis = "logFC log2(protein)", y_axis = "-log10(p.value)", 
+             file_suffix = "_kpmp_combined_plasma",
+             formula = "log2(protein) + treatment", 
+             cell_type = "Combined (EC, VSMC, Immune, Glom)",
+             positive_text = "Positively associated\nwith transcript",
+             negative_text = "Negatively associated\nwith transcript") + 
+  geom_vline(xintercept = 0, color = "grey", linetype = "dashed", size = 0.2)
+
+create_directional_volcano(
+  rna_data = combined_p_kpmp,
+  protein_data = combined_plasma %>% filter(`logFC_log2(protein)` > -10),
+  cell_type_name = "Combined (EC, VSMC, Immune, Glom)"
+)
+ggsave(file.path(root_path, "ATTEMPT/Results/Figures/Proteomics/Volcano Plots/plasma_combined.png"))
+```
+
+```{r echo = F}
+combined_concordance_plasma <- concordance_by_celltype(
+  biofluid_df = combined_plasma,
+  scrna_df    = combined_p_kpmp,
+  biofluid_label = "plasma",
+  celltype = "Combined",
+  out_dir = file.path(root_path, "ATTEMPT/Results/Somascan/Transcript concordance")
+)
+```
+
+# Looking for overlap between treatment DiD & proteomics DiD
+
+```{r echo = F}
+## read mixed model results dataframe (rendered in Hyak)
+# process and read all results from ATTEMPT
+celltype_groups <- list(
+  # PC              = c("CCD-PC", "CNT-PC", "dCCD-PC", "M-PC", "tPC-IC"),
+  EC              = c("EC-AVR", "EC-GC", "EC-PTC", "EC-AEA", "EC-LYM", "EC/VSMC"),
+  Immune          = c("MAC", "MON", "cDC", "pDC", "CD4+ T", "CD8+ T", "B", "NK"),
+  Immune_myeloid  = c("MAC", "MON", "cDC", "pDC"),
+  Immune_lymphoid = c("CD4+ T", "CD8+ T", "B", "NK"),
+  VSMC_P_FIB      = c("VSMC/P", "FIB"),
+  POD = c("POD")
+)
+
+
+## read mixed model results dataframe (rendered in Hyak)
+# process and read all results from ATTEMPT
+# Full gene set
+for (cell in names(celltype_groups))  {
+print(paste0("Processing: ", cell))
+  input_path <- paste0("grouped/", cell, "/ALL/nebula/", "grouped_", tolower(cell), "_kpmp_attempt_nebula_res_reml_pooled.rds")
+  cell_df <- s3readRDS(input_path, bucket = "attempt", region = "")
+
+  processed <- process_nebula_results(cell_df)
+  lower_cell <- tolower(cell)
+  var_name <- paste0(lower_cell, "_kpmp")
+
+  assign(var_name, processed$results)
+}
+
+did_res_plasma_mixed <- s3readRDS("Proteomics/plasma_proteomics_res.RDS", "attempt", region = "")
+```
+
+```{r echo = F}
+plasma_res <- batch_concordance_analysis(
+  protein_data = did_res_plasma_mixed$results_annotated,  # This is correct
+  transcript_data_list = list(EC = pt_kpmp, Immune = immune_kpmp, 
+                              Immune_myeloid = immune_myeloid_kpmp,
+                              Immune_lymphoid = immune_lymphoid_kpmp, 
+                              VSMC_P_FIB = vsmc_p_fib_kpmp, POD = pod_kpmp),
+  protein_source = 'plasma',
+  output_dir = "/Users/choiyej/Library/CloudStorage/OneDrive-SharedLibraries-UW/Laura Pyle - Bjornstad/Biostatistics Core Shared Drive/ATTEMPT/Results/Figures/Pathways/enrichr"
+)
+```
+
+# Organ Age
+
+```{r}
+library(reticulate)
+py$soma <- soma
+```
+
+```{python}
+import pandas as pd
+import numpy as np
+from organage import OrganAge
+import matplotlib.pyplot as plt
+import seaborn as sns
+import re
+
+# create a metadata df with record_id, sex, and age
+soma['Sex_F'] = (soma['sex'] == 'Female').astype(int)
+soma['record_id_visit'] = soma['record_id'].astype(str) + '_' + soma['visit'].astype(str)
+soma = soma.set_index('record_id_visit')
+
+metadata_columns = ['age', 'Sex_F']
+soma_md = soma[metadata_columns].copy()
+soma_md = soma_md.rename(columns={'age': 'Age'})
+
+# create a df with record_id_visit and proteins
+seq_columns = [col for col in soma.columns if re.match(r'^seq\.\d+\.\d+', col) and '_' not in col]
+len(seq_columns) # 11k panel
+soma_prot = soma[seq_columns].copy()
+soma_prot.columns = soma_prot.columns.str.replace('seq.', '', regex=False).str.replace('.', '-', regex=False)
+
+# calculate organ age
+data = OrganAge.CreateOrganAgeObject()
+data.add_data(soma_md, soma_prot)
+data.normalize(assay_version="v5")  #requires "v4" 5k, or "v4.1" 7k, or "v5" 11k
+res = data.estimate_organ_ages()
+res
+
+
+toplot = res.loc[res.Organ=="Kidney"]
+toplot = toplot.sort_values("Age")
+sns.scatterplot(data=toplot, x="Age", y="Predicted_Age", 
+                hue="AgeGap_zscored", palette='coolwarm', hue_norm=(-3,3))                
+plt.plot(toplot.Age, toplot.yhat_lowess)
+plt.show()
+```

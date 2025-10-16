@@ -1,0 +1,642 @@
+---
+title: "ATTEMPT CROCODILE comparison nebula visualization (KPMP celltype)"
+author: "Ye Ji Choi"
+date: "`r lubridate::today()`"
+format: 
+  html:
+    toc: true
+    toc-depth: 5
+    toc-location: left
+    code-fold: true
+    embed-resources: true
+---
+
+```{r echo = F, include = F}
+library(dplyr)
+library(kableExtra)
+library(knitr)
+library(ggplot2)
+library(purrr)
+library(tidyr)
+library(stats)
+library(patchwork)
+library(UpSetR)
+library(readxl)
+library(fgsea)
+library(ReactomeGSA)
+library(GSEABase)
+library(enrichplot)
+library(enrichR)
+library(ggrepel)
+library(forcats)
+library(stringr)
+library(jsonlite)
+library(aws.s3)
+source("~/GitHub/CHCO-Code/Petter Bjornstad/ATTEMPT/attempt_functions.R")
+```
+
+```{r include = F}
+## Create an S3 client
+keys <- fromJSON("/Users/choiyej/Library/CloudStorage/OneDrive-TheUniversityofColoradoDenver/Bjornstad Pyle Lab/keys.json")
+
+Sys.setenv(
+  "AWS_ACCESS_KEY_ID" = keys$MY_ACCESS_KEY,
+  "AWS_SECRET_ACCESS_KEY" = keys$MY_SECRET_KEY,
+  "AWS_DEFAULT_REGION" = "",
+  "AWS_REGION" = "",
+  "AWS_S3_ENDPOINT" = "s3.kopah.uw.edu"
+)
+```
+
+
+```{r echo = F}
+## read mixed model results dataframe (rendered in Hyak)
+# process and read all results from CROCODILE (limited to significant results from ATTEMPT non-HVG model)
+
+celltype_groups <- list(
+  PT = c("PT-S1/S2", "PT-S3", "aPT"),
+  TAL = c("C-TAL-1", "C-TAL-2", "aTAL", "dTAL"),
+  PC = c("CCD-PC", "CNT-PC", "dCCD-PC", "M-PC", "tPC-IC"),
+  EC = c("EC-AVR", "EC-GC", "EC-PTC", "EC-AEA", "EC-LYM", "EC/VSMC"),
+  IC = c("IC-A", "IC-B", "aIC"),
+  Immune = c("MAC", "MON", "cDC", "pDC", "CD4+ T", "CD8+ T", "B", "NK"),
+  Immune_myeloid = c("MAC", "MON", "cDC", "pDC"),
+  Immune_lymphoid = c("CD4+ T", "CD8+ T", "B", "NK"),
+  VSMC_P_FIB = c("VSMC/P", "FIB"),
+  POD = "POD"
+)
+
+# Top 2000 HVG
+for (cell in names(celltype_groups))  {
+  input_path <- paste0("/CROCODILE comparison analysis/", toupper(cell), "/nebula/", tolower(cell),"_kpmp_croc_hvg.rds")
+  cell_df <- s3readRDS(input_path, bucket = "attempt", region = "")
+  
+  processed <- process_nebula_results(cell_df, pval_col = "p_groupType_1_Diabetes")
+  lower_cell <- tolower(cell)
+  var_name <- paste0(lower_cell, "_croc_untargeted_res_hvg")
+  
+  assign(var_name, processed$results)
+  
+  write.csv(processed$results, paste0("/Users/choiyej/Library/CloudStorage/OneDrive-SharedLibraries-UW/Laura Pyle - Bjornstad/Biostatistics Core Shared Drive/ATTEMPT/Results/nebula/", tolower(cell), "_kpmp_croc_hvg_res.csv"), row.names = F)
+}
+
+# Targeted
+for (cell in names(celltype_groups))  {
+  input_path <- paste0("/CROCODILE comparison analysis/", toupper(cell), "/nebula/", tolower(cell),"_kpmp_croc_attempt_targeted.rds")
+  cell_df <- s3readRDS(input_path, bucket = "attempt", region = "")
+  
+  processed <- process_nebula_results(cell_df, pval_col = "p_groupType_1_Diabetes")
+  lower_cell <- tolower(cell)
+  var_name <- paste0(lower_cell, "_croc_targeted_res")
+  
+  assign(var_name, processed$results)
+  
+  write.csv(processed$results, paste0("/Users/choiyej/Library/CloudStorage/OneDrive-SharedLibraries-UW/Laura Pyle - Bjornstad/Biostatistics Core Shared Drive/ATTEMPT/Results/nebula/", tolower(cell), "_kpmp_croc_targeted_res.csv"), row.names = F)
+}
+```
+
+```{r echo = F}
+## read mixed model results dataframe (rendered in Hyak)
+# process and read all results from ATTEMPT
+celltype_groups <- list(
+  PT = c("PT-S1/S2", "PT-S3", "aPT"),
+  TAL = c("C-TAL-1", "C-TAL-2", "aTAL", "dTAL"),
+  PC = c("CCD-PC", "CNT-PC", "dCCD-PC", "M-PC", "tPC-IC"),
+  EC = c("EC-AVR", "EC-GC", "EC-PTC", "EC-AEA", "EC-LYM", "EC/VSMC"),
+  IC = c("IC-A", "IC-B", "aIC"),
+  Immune = c("MAC", "MON", "cDC", "pDC", "CD4+ T", "CD8+ T", "B", "NK"),
+  Immune_myeloid = c("MAC", "MON", "cDC", "pDC"),
+  Immune_lymphoid = c("CD4+ T", "CD8+ T", "B", "NK"),
+  VSMC_P_FIB = c("VSMC/P", "FIB"),
+  POD = "POD"
+)
+for (cell in names(celltype_groups))  {
+  input_path <- paste0("grouped/", cell, "/ALL/nebula/", "grouped_", tolower(cell), "_kpmp_attempt_nebula_res_reml_pooled.rds")
+  cell_df <- s3readRDS(input_path, bucket = "attempt", region = "")
+
+  processed <- process_nebula_results(cell_df)
+  
+  # Join annotation
+  annotated_df <- processed$results
+
+  # Assign to variable dynamically
+  var_name <- paste0(tolower(cell), "_kpmp")
+  assign(var_name, annotated_df, envir = .GlobalEnv)
+
+}
+```
+
+## Volcano plots
+
+### Targeted
+
+```{r echo = F}
+for (cell in names(celltype_groups)) {
+  message("Processing: ", cell)
+  plot_croc_attempt_volcano(
+    attempt_df = get(paste0(tolower(cell), "_kpmp")),
+    croc_df = get(paste0(tolower(cell), "_croc_targeted_res")),
+    cell_type = cell,
+    top_n = 20,
+    save_path = paste0("/Users/choiyej/Library/CloudStorage/OneDrive-SharedLibraries-UW/Laura Pyle - Bjornstad/Biostatistics Core Shared Drive/ATTEMPT/Results/Figures/CROCODILE comparison/Volcano Plots/kpmp_", tolower(cell), "_targeted_volcano_attempt_directions_labeled.png")
+  )
+}
+```
+
+```{r echo = F}
+for (cell in names(celltype_groups)) {
+  message("Processing: ", cell)
+  plot_volcano(
+    data = get(paste0(tolower(cell), "_croc_targeted_res")),
+    fc = "logFC_groupType_1_Diabetes", 
+    p_col = "p_groupType_1_Diabetes",
+    title = NULL,
+    x_axis = "logFC group (Type 1 Diabetes)", 
+    y_axis = "-log10(p-value)",
+    file_suffix = paste0("CROCODILE comparison analysis/kpmp_", tolower(cell), "_croc_pvalue_nebula_reml_offset"), 
+    cell_type = cell
+  )
+  
+    plot_volcano(
+    data = get(paste0(tolower(cell), "_croc_targeted_res")),
+    fc = "logFC_groupType_1_Diabetes", 
+    p_col = "fdr",
+    title = NULL,
+    x_axis = "logFC group (Type 1 Diabetes)", 
+    y_axis = "-log10(FDR adjusted p-value)",
+    file_suffix = paste0("CROCODILE comparison analysis/kpmp_", tolower(cell), "_croc_fdr_nebula_reml_offset"), 
+    cell_type = cell
+  )
+}
+```
+
+### Untargeted
+
+```{r echo = F}
+for (cell in names(celltype_groups)) {
+  message("Processing: ", cell)
+  plot_croc_attempt_volcano(
+    attempt_df = get(paste0(tolower(cell), "_kpmp")),
+    croc_df = get(paste0(tolower(cell), "_croc_untargeted_res_hvg")),
+    cell_type = cell,
+    top_n = 20,
+    save_path = paste0("/Users/choiyej/Library/CloudStorage/OneDrive-SharedLibraries-UW/Laura Pyle - Bjornstad/Biostatistics Core Shared Drive/ATTEMPT/Results/Figures/CROCODILE comparison/Volcano Plots/kpmp_", tolower(cell), "_untargeted_volcano_attempt_directions_labeled.png")
+  )
+}
+```
+
+```{r echo = F}
+for (cell in names(celltype_groups)) {
+  message("Processing: ", cell)
+  plot_volcano(
+    data = get(paste0(tolower(cell), "_croc_untargeted_res_hvg")),
+    fc = "logFC_groupType_1_Diabetes", 
+    p_col = "p_groupType_1_Diabetes",
+    title = NULL,
+    x_axis = "logFC group (Type 1 Diabetes)", 
+    y_axis = "-log10(p-value)",
+    file_suffix = paste0("CROCODILE comparison analysis/kpmp_", tolower(cell), "_croc_pvalue_nebula_reml_offset"), 
+    cell_type = cell
+  )
+  
+    plot_volcano(
+    data = get(paste0(tolower(cell), "_croc_untargeted_res_hvg")),
+    fc = "logFC_groupType_1_Diabetes", 
+    p_col = "fdr",
+    title = NULL,
+    x_axis = "logFC group (Type 1 Diabetes)", 
+    y_axis = "-log10(FDR adjusted p-value)",
+    file_suffix = paste0("CROCODILE comparison analysis/kpmp_", tolower(cell), "_croc_fdr_nebula_reml_offset"), 
+    cell_type = cell
+  )
+}
+```
+# Heatmap plots
+
+```{r echo = F}
+library(tidyverse)
+library(ggplot2)
+library(ggpubr)
+library(patchwork)
+
+# Manual functional grouping based on your actual genes
+# You'll need to customize these based on the genes shown in your heatmaps
+kidney_gene_groups <- list(
+  PT = list(
+    # Group genes from your PT heatmap
+    "Membrane transport" = c("PITPNM1", "SLC5A2", "SLC5A1", "SLC13A3"),
+    "Signaling/Kinases" = c("RALGAPA2", "SYNJ1", "RAB12", "KCTD8", "PIK3R1", 
+                            "MAPK9", "MAPK1", "PIP4K2B", "KIF3B"),
+    "Metabolism" = c("CSGALNACT2", "SOS2", "FBXO9", "SNX30", "MFAP3L"),
+    "Cytoskeleton/ECM" = c("ERBIN", "PLSCR4", "CNOT1", "DCAKD", "CARNMT1"),
+    "Transcription" = c("IDE", "CAB39", "ATE1", "HIPK3", "CUL5", "DDX6"),
+    "Cell adhesion" = c("CCDC6", "GTF2E2", "TACC2", "ADD1", "DCAF8", "MTPN"),
+    "Other" = c("COMMD6", "MGST3", "COX6A1", "ARPC5L", "COX7A2", 
+                "AP1S1", "PPDPF", "ATP5PD", "COX5B")
+  ),
+  
+  TAL = list(
+    "Transcription factors" = c("BHLHE40", "KLF9", "ZNF302", "CLDN10", "PFDN4"),
+    "Cell signaling" = c("BACE2", "RNMT", "STT3A", "XPA", "ADAM9"),
+    "Ion transport" = c("CHOT", "ERGIC2", "PCMT1", "SORL1"),
+    "Metabolism" = c("NIMGP", "GINM1", "FH", "SELENOS", "COMTD1"),
+    "Cell cycle/DNA" = c("CDC123", "MITD1", "PPIB", "PRXL2A"),
+    "Membrane proteins" = c("TMEM175", "TSPAN31", "MRPS25", "MCRS1"),
+    "ECM/Adhesion" = c("TECR", "VPS25", "EDEM2", "CD58", "HSF1"),
+    "Other" = c("ARMCX1", "SUPT7L", "C1GALT1C1", "NIT2", "TTF1",
+                "PLEKHF2", "PHF11", "ECH1", "HPF1", "CCDC127",
+                "CC21B", "S100A4", "MFSD10", "AC027644.3", "ABHD14A", "IFI6")
+  ),
+  
+  EC = list(
+    "Kinases/Signaling" = c("PIK3C2A", "KLF9", "ARHGAP18", "RGCC", "GRB14"),
+    "Transcription" = c("ECHS1"),
+    "Other" = c()
+  ),
+  
+  IC = list(
+    "Ion channels" = c("CNTLN", "KCNN3", "HNRNPA0", "AGTPBP1"),
+    "Cell adhesion" = c("ARL13B", "SOX4", "RBMS2", "DDX6"),
+    "Metabolism" = c("NUP88", "UBL3", "LNX2", "DOCK9"),
+    "Transcription factors" = c("FAM169A", "ST6GAL1", "PRKAR1A", "SFPO"),
+    "Signaling" = c("WASHC5", "RBM22", "HNRNPC", "KAT7"),
+    "Other" = c("FAM193A", "ZNF528", "RNF138", "IRF2BP2", "PHF2",
+                "EPM2AIP1", "DCAF16", "PCBP2", "MAGT1", "SPAG9",
+                "ADAR", "TBCD", "SPART", "NFIC", "NUS1", "SLC25A1",
+                "FAF2", "DSTYK", "PPME1", "ZFP36L1", "KCNC4",
+                "ATN1", "TUG1", "GTF2H2C", "GAPVD1", "CNOT7",
+                "KPNB1", "ARPP19", "G3BP1", "RAB21")
+  ),
+  
+  POD = list(
+    "Transcription" = c("HIPK2"),
+    "Other" = c()
+  )
+)
+
+# Function to assign genes to functional groups - more flexible version
+assign_gene_functions <- function(genes, cell_type, custom_groups = NULL) {
+  # Use custom groups if provided, otherwise use default
+  gene_groups <- if(!is.null(custom_groups) && cell_type %in% names(custom_groups)) {
+    custom_groups[[cell_type]]
+  } else if(cell_type %in% names(kidney_gene_groups)) {
+    kidney_gene_groups[[cell_type]]
+  } else {
+    list(Other = character())
+  }
+  
+  gene_df <- data.frame(Gene = genes, functional_group = NA, stringsAsFactors = FALSE)
+  
+  for (gene in genes) {
+    assigned <- FALSE
+    for (group_name in names(gene_groups)) {
+      if (group_name != "Other" && toupper(gene) %in% toupper(gene_groups[[group_name]])) {
+        gene_df[gene_df$Gene == gene, "functional_group"] <- group_name
+        assigned <- TRUE
+        break
+      }
+    }
+    if (!assigned) {
+      gene_df[gene_df$Gene == gene, "functional_group"] <- "Other"
+    }
+  }
+  
+  return(gene_df)
+}
+
+# Function to create bracket annotations - improved version
+create_functional_brackets <- function(plot_df, cell_type) {
+  # Get unique genes in order (excluding padding)
+  genes_unique <- plot_df %>%
+    filter(!is.na(logFC) & direction != "") %>%
+    select(Gene) %>%
+    distinct() %>%
+    pull(Gene)
+  
+  if(length(genes_unique) == 0) return(list())
+  
+  # Assign functional groups
+  gene_functions <- assign_gene_functions(genes_unique, cell_type)
+  
+  # Get the factor levels from plot_df to maintain order
+  gene_order <- levels(plot_df$Gene)
+  
+  # Order by plot order and add positions
+  gene_functions <- gene_functions %>%
+    mutate(Gene = factor(Gene, levels = gene_order)) %>%
+    arrange(Gene) %>%
+    mutate(y_position = as.numeric(Gene))
+  
+  # Debug: print what we're working with
+  message("Cell type: ", cell_type)
+  message("Number of genes: ", nrow(gene_functions))
+  message("Functional groups found: ", paste(unique(gene_functions$functional_group), collapse = ", "))
+  
+  # Find consecutive genes with same function
+  brackets <- list()
+  
+  if(nrow(gene_functions) > 0) {
+    current_func <- gene_functions$functional_group[1]
+    start_y <- gene_functions$y_position[1]
+    
+    for(i in 1:nrow(gene_functions)) {
+      # Check if we're at the end or function changes
+      if(i == nrow(gene_functions) || 
+         (i < nrow(gene_functions) && gene_functions$functional_group[i+1] != current_func)) {
+        
+        # Only create bracket if not "Other" and has more than 1 gene
+        end_y <- gene_functions$y_position[i]
+        if(end_y - start_y >= 0) {
+          brackets[[length(brackets) + 1]] <- list(
+            start = start_y,
+            end = end_y,
+            label = current_func
+          )
+        }
+        
+        # Start new group if not at end
+        if(i < nrow(gene_functions)) {
+          current_func <- gene_functions$functional_group[i+1]
+          start_y <- gene_functions$y_position[i+1]
+        }
+      }
+    }
+  }
+  
+  message("Number of brackets created: ", length(brackets))
+  return(brackets)
+}
+
+# Modified plotting code for each cell type
+for (cell in names(celltype_groups)) {
+  message("\n=== Processing: ", cell, " ===")
+  
+  top_n = 50
+  target_n = top_n*2
+  croc_attempt_df <- create_croc_attempt_df(
+    attempt_df = get(paste0(tolower(cell), "_kpmp")),
+    croc_df = get(paste0(tolower(cell), "_croc_targeted_res")),
+    cell_type = cell
+  )
+  
+  n_reversed = croc_attempt_df %>%
+    filter(direction == "reversed") %>%
+    nrow()
+  
+  n_nonreversed = croc_attempt_df %>%
+    filter(direction == "non-reversed") %>%
+    nrow()
+  
+  # First, get top genes by p-value
+  top_genes_df <- croc_attempt_df %>%
+    filter(direction == "reversed") %>%
+    arrange(p.val_croc) %>%
+    head(n = top_n)
+  
+  # Assign functional groups
+  gene_func_df <- assign_gene_functions(top_genes_df$Gene, cell)
+  
+  # Join and reorder by functional group (alphabetically), then by p-value within groups
+  top_genes_df <- top_genes_df %>%
+    left_join(gene_func_df, by = "Gene") %>%
+    # Sort by functional group alphabetically first (excluding "Other"), then p-value
+    mutate(
+      group_sort = ifelse(functional_group == "Other", "ZZZZ", functional_group)
+    ) %>%
+    arrange(group_sort, p.val_croc) %>%
+    select(-group_sort)
+  
+  # Now pivot longer
+  croc_attempt_df <- top_genes_df %>%
+    pivot_longer(
+      cols = c(logFC_attempt, p.val_attempt, logFC_croc, p.val_croc),
+      names_to = c(".value", "study"),
+      names_pattern = "(logFC|p.val)_(.*)"
+    ) %>%
+    group_by(Gene) %>%
+    mutate(diff_logFC = logFC[study == "attempt"] - logFC[study == "croc"]) %>%
+    ungroup()
+  
+  # Padding if needed - add at the end instead of beginning
+  if (nrow(croc_attempt_df) < target_n) {
+    n_add <- (target_n - nrow(croc_attempt_df))/2
+    placeholder_genes <- paste0("_", seq_len(n_add))  # Add underscore to make clear they're placeholders
+    study_pad <- if (is.factor(croc_attempt_df$study)) {
+      factor(rep("croc", n_add), levels = levels(croc_attempt_df$study))
+    } else {
+      rep("croc", n_add)
+    }
+    
+    pad_rows <- tibble(
+      Gene = placeholder_genes,
+      direction = rep("", n_add),
+      cell_type = rep("", n_add),
+      functional_group = rep("ZZZZ_blank", n_add),  # Special group to sort last
+      study = study_pad,
+      logFC = rep(NA, n_add),
+      p.val = rep(NA, n_add),
+      diff_logFC = rep(max(croc_attempt_df$diff_logFC, na.rm = TRUE) + 1, n_add)  # Changed to max to put at bottom
+    )
+    
+    plot_df <- bind_rows(croc_attempt_df, pad_rows) %>%
+      dplyr::mutate(
+        # Reverse the order so A is at top, blanks at bottom
+        Gene = factor(Gene, levels = rev(unique(c(croc_attempt_df$Gene, pad_rows$Gene)))),
+        study = case_when(
+          study == "croc" ~ "T1D\nvs.\nHC",
+          study == "attempt" ~ "Dapagliflozin\nvs.\nPlacebo"
+        )
+      )
+  } else {
+    plot_df <- croc_attempt_df %>%
+      dplyr::mutate(
+        Gene = factor(Gene, levels = rev(unique(Gene))),  # Reverse for proper display
+        study = case_when(
+          study == "croc" ~ "T1D\nvs.\nHC",
+          study == "attempt" ~ "Dapagliflozin\nvs.\nPlacebo"
+        )
+      )
+  }
+  
+  plot_df$study = factor(plot_df$study, levels = c("T1D\nvs.\nHC", "Dapagliflozin\nvs.\nPlacebo"))
+  
+  # Get brackets for functional groups
+  brackets <- create_functional_brackets(plot_df, cell)
+  
+  # Create base heatmap
+  p <- ggplot(plot_df, aes(x = study, y = Gene, fill = logFC)) +
+    geom_tile() +
+    scale_fill_gradient2(
+      low = "#89c2d9", mid = "white", high = "#ee7674", 
+      midpoint = 0, na.value = "#00000000"
+    ) +
+    geom_text(aes(x = 1.5, label = Gene),
+              color = ifelse(plot_df$direction == "", "#00000000", "black")) +
+    theme_minimal() +
+    theme(
+      axis.text.y = element_blank(),
+      panel.grid = element_blank(),
+      plot.subtitle = element_text(hjust = 0.5, color = "black"),
+      text = element_text(size = 15),
+      legend.text = element_text(angle = 60, hjust = 1),
+      plot.margin = margin(0, 5, 0, 0)  # Extra right margin for rotated text brackets
+    ) +
+    labs(x = NULL, y = NULL,
+         subtitle = paste0("Cell type: ", cell,
+                          "\n", n_reversed, "/", n_reversed+n_nonreversed, 
+                          " reversed to\nHC state")) +
+    scale_x_discrete(position = "top")
+  
+  # Add functional group brackets on the right
+  if(length(brackets) > 0) {
+    for(bracket in brackets) {
+      # Abbreviated labels for space - customize as needed
+      label_abbrev <- case_when(
+        grepl("transport", bracket$label, ignore.case = TRUE) ~ "Transport",
+        grepl("signal|kinase", bracket$label, ignore.case = TRUE) ~ "Signal",
+        grepl("metab", bracket$label, ignore.case = TRUE) ~ "Metab",
+        grepl("transcript", bracket$label, ignore.case = TRUE) ~ "TF",
+        grepl("cytoskel|ECM", bracket$label, ignore.case = TRUE) ~ "Struct",
+        grepl("adhes", bracket$label, ignore.case = TRUE) ~ "Adhes",
+        grepl("channel", bracket$label, ignore.case = TRUE) ~ "Channel",
+        TRUE ~ substr(bracket$label, 1, 8)  # First 8 chars if no match
+      )
+      
+      # Draw bracket
+      bracket_x <- 2.51
+      p <- p + 
+        annotate("segment", 
+                 x = bracket_x, xend = bracket_x + 0.05,
+                 y = bracket$start - 0.3, yend = bracket$start - 0.3,
+                 color = "gray30", size = 0.4) +
+        annotate("segment",
+                 x = bracket_x + 0.05, xend = bracket_x + 0.05,
+                 y = bracket$start - 0.3, yend = bracket$end + 0.3,
+                 color = "gray30", size = 0.4) +
+        annotate("segment",
+                 x = bracket_x, xend = bracket_x + 0.05,
+                 y = bracket$end + 0.3, yend = bracket$end + 0.3,
+                 color = "gray30", size = 0.4) +
+        annotate("text",
+                 x = bracket_x + 0.1, y = (bracket$start + bracket$end)/2,
+                 label = label_abbrev,
+                 size = 3.5, hjust = 0.5, vjust = 0, color = "gray30", angle = 270)  # Rotated 90 degrees and bigger text
+    }
+    
+    # Expand x-axis limits to show brackets
+    p <- p + coord_cartesian(xlim = c(1, 2), clip = "off")
+  }
+  
+  assign(paste0(tolower(cell), "_croc_attempt_heat"), p)
+}
+
+# Combine all plots
+final_plot <- ggarrange(
+  pt_croc_attempt_heat, tal_croc_attempt_heat, ec_croc_attempt_heat,
+  ic_croc_attempt_heat, pod_croc_attempt_heat+ coord_cartesian(xlim = c(1, 2.1), clip = "off"), 
+  labels = "AUTO",
+  common.legend = TRUE, 
+  nrow = 1
+)
+
+print(final_plot)
+ggsave(file.path(root_path, "ATTEMPT/Results/Figures/Panels/croc_attempt_rev_heatmap_2.png"), width = 12, height = 12)
+
+```
+
+```{r echo = F}
+for (cell in names(celltype_groups)) {
+  message("Processing: ", cell)
+  
+  top_n = 50
+  target_n = top_n*2
+  croc_attempt_df <- create_croc_attempt_df(attempt_df = get(paste0(tolower(cell), "_kpmp")),
+                                            croc_df = get(paste0(tolower(cell), "_croc_targeted_res")),
+                                            cell_type = cell)
+  
+  n_reversed = croc_attempt_df %>%
+    filter(direction == "reversed") %>%
+    nrow()
+  
+  n_nonreversed = croc_attempt_df %>%
+    filter(direction == "non-reversed") %>%
+    nrow()
+  
+  croc_attempt_df <- croc_attempt_df %>%
+    filter(direction == "reversed") %>%
+    arrange(p.val_croc) %>%
+    head(n = top_n) %>%
+    pivot_longer(
+      cols = c(logFC_attempt, p.val_attempt, logFC_croc, p.val_croc),
+      names_to = c(".value", "study"),
+      names_pattern = "(logFC|p.val)_(.*)"
+    ) %>%
+    group_by(Gene) %>%
+    mutate(diff_logFC = logFC[study == "attempt"] - logFC[study == "croc"]) %>%
+    ungroup() 
+  
+if (nrow(croc_attempt_df) < target_n) {
+  n_add <- (target_n - nrow(croc_attempt_df))/2
+  placeholder_genes <- paste0(seq_len(n_add))
+  # keep types stable, esp. for factor `study`
+  study_pad <- if (is.factor(croc_attempt_df$study)) {
+    factor(rep("croc", n_add), levels = levels(croc_attempt_df$study))
+  } else {
+    rep("croc", n_add)
+  }
+  
+  pad_rows <- tibble(
+    Gene       = placeholder_genes,
+    direction  = rep("", n_add),
+    cell_type  = rep("", n_add),
+    study      = study_pad,
+    logFC      = rep(NA, n_add),
+    p.val      = rep(NA, n_add),
+    diff_logFC = rep(min(croc_attempt_df$diff_logFC) - 1, n_add)  # <- Fixed here
+  )
+  
+  plot_df <- bind_rows(croc_attempt_df, pad_rows) %>%
+    dplyr::mutate(Gene = reorder(Gene, diff_logFC),
+                  study = case_when(
+                    study == "croc" ~ "T1D\nvs.\nHC",
+                    study == "attempt" ~ "Dapagliflozin\nvs.\nPlacebo"
+                  ))
+} else {
+  # Don't forget to handle the case when no padding is needed!
+  plot_df <- croc_attempt_df %>%
+    dplyr::mutate(Gene = reorder(Gene, diff_logFC),
+                  study = case_when(
+                    study == "croc" ~ "T1D\nvs.\nHC",
+                    study == "attempt" ~ "Dapagliflozin\nvs.\nPlacebo"))
+}  
+  plot_df$study = factor(plot_df$study, levels = c("T1D\nvs.\nHC",
+                                                   "Dapagliflozin\nvs.\nPlacebo"))
+  p <- ggplot(plot_df, aes(x = study, y = Gene, fill = logFC)) +
+    geom_tile() +
+    scale_fill_gradient2(
+      low = "#89c2d9", mid = "white", high = "#ee7674", midpoint = 0, na.value = "#00000000"
+    ) +
+    geom_text(label = plot_df$Gene, aes(x = 1.5),
+              color = ifelse(plot_df$direction == "", "#00000000", "black")
+              ) +
+    theme_minimal() +
+    theme(axis.text.y = element_blank(),
+          panel.grid = element_blank(),
+          plot.subtitle = element_text(hjust = 0.5, color = "black"),
+          text = element_text(size = 15),
+          legend.text = element_text(angle = 60, hjust = 1)) +
+    labs(x = NULL, y = NULL,
+         subtitle = paste0("Cell type: ", cell,
+                          "\n", n_reversed, "/", n_reversed+n_nonreversed, " reversed to\nHC state")) +
+    scale_x_discrete(position = "top")
+  
+  assign(paste0(tolower(cell), "_croc_attempt_heat"), p)
+}
+
+ggarrange(pt_croc_attempt_heat, tal_croc_attempt_heat, ec_croc_attempt_heat,
+          ic_croc_attempt_heat, pod_croc_attempt_heat, labels = "AUTO",
+          common.legend = T, nrow = 1, hjust = 0, vjust = 0.8)
+
+
+ggsave(file.path(root_path, "ATTEMPT/Results/Figures/Panels/croc_attempt_rev_heatmap.png"), width = 12, height = 12)
+```
