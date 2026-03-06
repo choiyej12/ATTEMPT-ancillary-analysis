@@ -13,6 +13,7 @@ format:
 
 ```{r libraries, message = F, warning=F}
 #| include: false
+# load required packages for scRNA-seq analysis
 library(future)
 library(future.apply)
 library(tidyverse)
@@ -26,9 +27,7 @@ library(arsenal)
 library(Biobase)
 library(msigdbr)
 library(kableExtra)
-# library(knitr)
 library(REDCapR)
-# library(data.table)
 library(emmeans)
 library(NMF)
 library(pheatmap)
@@ -51,7 +50,7 @@ library(jsonlite)
 library(dplyr)
 library(glmmTMB)
 library(reshape2)
-library(broom.mixed) 
+library(broom.mixed)
 library(foreach)
 library(doParallel)
 library(nebula)
@@ -59,30 +58,34 @@ library(Matrix)
 library(scran)
 library(DirichletReg)
 library(BiocParallel)
-# library(scDC)
 library(DoubletFinder)
 library(scCustomize)
-library(msigdbr)
-source("/mmfs1/gscratch/togo/yejichoi/CHCO-Code/Petter Bjornstad/ATTEMPT/attempt_functions.R")
+library(here)
+
+# source shared ATTEMPT analysis functions (from this repository)
+source(here("attempt_functions.R"))
 ```
 
 ```{r include = F}
-reticulate::use_python("/mmfs1/gscratch/togo/yejichoi/mypy/bin/python", required = T)
+# configure Python environment for S3 access via boto3
+# NOTE: users must set ATTEMPT_PYTHON_PATH to their Python installation
+reticulate::use_python(Sys.getenv("ATTEMPT_PYTHON_PATH", unset = "python3"), required = T)
 reticulate::repl_python()
 reticulate::py_config()
-# set up Kopah connection
-## Load boto3 and pandas
+
+# set up Kopah S3 connection via boto3
 boto3 <- reticulate::import("boto3")
 pd <- reticulate::import("pandas")
 
-## Create an S3 client
-keys <- fromJSON("/mmfs1/home/yejichoi/keys.json")
+# configure S3 credentials
+# NOTE: users must provide their own keys.json with AWS credentials
+keys <- fromJSON(Sys.getenv("ATTEMPT_KEYS_PATH", unset = "keys.json"))
 session <- boto3$session$Session(
   aws_access_key_id = keys$MY_ACCESS_KEY,
   aws_secret_access_key = keys$MY_SECRET_KEY
 )
 
-## Create an S3 client with the session
+# create S3 client for Kopah storage
 s3 <- session$client("s3", endpoint_url = "https://s3.kopah.uw.edu")
 ```
 
@@ -92,22 +95,11 @@ temp_file <- tempfile(fileext = ".RDS")
 s3$download_file("scrna", "Kidney transcriptomics/Single cell RNA seq/PB_attempt_harmony_rpca_RM_kpmpV1labelled_Sept2024.RDS", temp_file)
 attempt_so_raw <- readRDS(temp_file)
 
-# N of cells for Petter (B-cells and POD at baseline)
-# attempt_so$celltype_pt <- ifelse(grepl("PT-", attempt_so$celltype),
-#                                  "PT", as.character(attempt_so$celltype))
-# attempt_so_pt <- subset(attempt_so, celltype_pt == "PT" & celltype != "PT_lowQuality")
-# attempt_so_b_bl <- subset(attempt_so, celltype == "B" & Visit == "BL")
-# attempt_so_pod_bl <- subset(attempt_so, celltype == "POD" & Visit == "BL")
-
 # Identify mitochondrial genes
 mito_genes <- grep("^MT-", rownames(attempt_so_raw), value = TRUE)
 
 # Calculate the percentage of mitochondrial transcripts per cell
 attempt_so_raw[["percent.mt"]] <- PercentageFeatureSet(attempt_so_raw, pattern = "^MT-")
-hist(attempt_so_raw$percent.mt)
-# FeaturePlot(attempt_so_raw, reduction = "umap.harmony", features = "percent.mt", cols = c("lightgray", "blue"), raster = F)
-# DimPlot(attempt_so_raw, reduction = "umap.harmony", group.by = "KPMP_celltype", raster = F, alpha = 0.2, label = T)
-# DimPlot(attempt_so_raw, reduction = "umap.harmony", group.by = "celltype", raster = F, alpha = 0.2, label = T)
 
 # Identify ribosomal genes
 ribo_genes <- c(
@@ -120,9 +112,7 @@ ribo_genes <- c(
   "RPL10", "RPS4Y1"
 ) # grep("^RPL|^RPS", rownames(attempt_so_raw), value = TRUE) captures some none ribosomal genes
 attempt_so_raw[["percent.ribo"]] <- PercentageFeatureSet(attempt_so_raw, features = ribo_genes)
-hist(attempt_so_raw$percent.ribo)
 
-# attempt_so_raw <- subset(attempt_so_raw, subset = percent.mt < 50) # keep as 50%, it's how it's done with KPMP
 FeaturePlot(attempt_so_raw, reduction = "umap.harmony", features = "percent.mt", cols = c("lightgray", "blue"), raster = F)
 DimPlot(attempt_so_raw, reduction = "umap.harmony", group.by = "KPMP_celltype", raster = F, alpha = 0.2, label = T)
 DimPlot(attempt_so_raw, reduction = "umap.harmony", group.by = "celltype", raster = F, alpha = 0.2, label = T)
@@ -135,50 +125,14 @@ expr_matrix <- as.matrix(GetAssayData(attempt_so_raw, layer = "data"))
 num_cells_per_gene <- rowSums(expr_matrix > 0)  # Count nonzero cells per gene
 total_cells <- ncol(expr_matrix)  # Total number of cells
 gene_proportion <- num_cells_per_gene / total_cells  # Fraction of cells expressing each gene
-length(gene_proportion) # 30625
 # Keep genes expressed in at least 5% of cells
 genes_to_keep <- names(gene_proportion[gene_proportion  >= 0.05])
-length(genes_to_keep) # 8672 ( ~ 28.3% remaining)
 
 remove(expr_matrix)
-# attempt_so_raw <- subset(attempt_so_raw, features = genes_to_keep)
 
 # renormalize after filtering
 attempt_so_raw <- NormalizeData(attempt_so_raw)
 
-# # # calculate cell library size for offset in NEBULA
-# counts_layer <- round(GetAssayData(attempt_so_raw, layer = "counts"))
-# library_size <- Matrix::colSums(counts_layer)
-# attempt_so_raw$library_size <- library_size
-# View(attempt_so_raw@meta.data)
-# 
-# # TMM offset
-# dge <- DGEList(counts = counts_layer)
-# dge <- calcNormFactors(dge, method = "TMM")
-# tmm_offset <- (dge$samples$lib.size) * (dge$samples$norm.factors)
-# attempt_so_raw$tmm_offset <- tmm_offset
-# 
-# # Pooled offset
-# bp <- MulticoreParam(workers = 63)
-# sce <- SingleCellExperiment(assays = list(counts = counts_layer))
-# # sce <- computeSumFactors(sce)
-# sce <- computeSumFactors(sce, BPPARAM = bp)
-# # # View size factors
-# sizeFactors(sce)
-# # Calculate offset → (size factors)
-# pooled_offset <- (sizeFactors(sce))
-# attempt_so_raw$pooled_offset <- pooled_offset
-
-## want to double check expression of some metallothionines because logFC for them in dapa is near 0
-# FindMarkers(subset(attempt_so_raw, grepl("PT-", attempt_so_raw$celltype) & treatment == "Placebo"), features = c("MT1X", "MT2A", "MT1M", "MT1H"), group.by = "visit", 
-#             min.pct = 0, logfc.threshold = 0,
-#             ident.1 = "POST")
-# 
-# FindMarkers(subset(attempt_so_raw, grepl("PT-", attempt_so_raw$celltype) & treatment == "Dapagliflozin 5mg"), features = c("MT1X", "MT2A", "MT1M", "MT1H"), group.by = "visit", 
-#             min.pct = 0, logfc.threshold = 0,
-#             ident.1 = "POST")
-
-# check for expression of TRHDE-AS1 (in immune), FGF14 (in immune), and PSAT1 (in fib/vsmc/p)
 FeaturePlot(attempt_so_raw, features = c("TRHDE-AS1", "FGF14", "PSAT1"), raster = F)
 DimPlot(attempt_so_raw, group.by = "celltype", raster = F, alpha = 0.2, label = T)
 
@@ -198,9 +152,6 @@ attempt_so_meta <- left_join(attempt_so_meta, dat, by = c("subject_id", "visit")
 rownames(attempt_so_meta) <- attempt_so_meta$barcode
 attempt_so_raw <- AddMetaData(attempt_so_raw, attempt_so_meta)
 options(future.globals.maxSize = 3000 * 1024^3)
-
-View(subset(attempt_so_meta, select = c(subject_id, visit, treatment, Cryostor_ID)) %>%
-       distinct(Cryostor_ID, .keep_all = T))
 ```
 
 
@@ -210,6 +161,7 @@ temp_file <- tempfile(fileext = ".rds")
 s3$download_file("attempt", 'cleaned_data/attempt_clean_so.rds', temp_file)
 attempt_so <- readRDS(temp_file)
 
+# map KPMP subtypes to general cell type categories
 attempt_so$KPMP_celltype_general <- case_when(
   attempt_so$KPMP_celltype %in% c("PT-S1/S2", "PT-S3", "aPT") ~ "PT",
   attempt_so$KPMP_celltype %in% c("C-TAL-1", "C-TAL-2", "aTAL", "dTAL") ~ "TAL",
@@ -399,6 +351,7 @@ cat(sprintf("\nNew metadata columns (%d total):\n", length(new_cols)))
 cat(paste(new_cols, collapse = ", "))
 ```
 ```{r echo = F}
+# map general cell types to module score column prefixes
 unique_celltypes <- unique(attempt_so@meta.data$KPMP_celltype_general)
 celltype_mapping <- c(
   "PT" = "pt",
@@ -413,8 +366,8 @@ celltype_mapping <- c(
   "VSMC/P, FIB" = "vsmc_p_fib"
 )
 
-# Function to create dynamic scores
-create_dynamic_scores <- function(seurat_obj, celltype_col = "KPMP_celltype_general", 
+# assign each cell its cell-type-specific module score
+create_dynamic_scores <- function(seurat_obj, celltype_col = "KPMP_celltype_general",
                                  celltype_mapping, score_type = "immune") {
   
   # Initialize score vector
@@ -469,8 +422,10 @@ attempt_so@meta.data$metabolism_score <- create_dynamic_scores(
 ```
 
 ```{r echo = F}
+# fit mixed models for module scores with treatment x visit DiD interaction
 attempt_so_meta <- attempt_so@meta.data
 
+# fit immune module score mixed model and get DiD contrasts by cell type
 immune_fit <- lmer(immune_score ~ treatment*visit*KPMP_celltype_general + (1|subject_id), data = attempt_so_meta)
 immune_emm <- emmeans(immune_fit, ~treatment*visit | KPMP_celltype_general)
 immune_contrasts <- contrast(immune_emm, interaction = "trt.vs.ctrl", by = "KPMP_celltype_general")
@@ -485,6 +440,7 @@ immune_contrasts_df <- immune_contrasts_df %>%
                          p.value < 0.05 & estimate < 0 ~ "-", 
                          T ~ "NS")) 
 
+# fit metabolic module score mixed model and get DiD contrasts by cell type
 metabolic_fit <- lmer(metabolism_score ~ treatment*visit*KPMP_celltype_general + (1|subject_id), data = attempt_so_meta)
 metabolic_emm <- emmeans(metabolic_fit, ~treatment*visit | KPMP_celltype_general)
 metabolic_contrasts <- contrast(metabolic_emm, interaction = "trt.vs.ctrl", by = "KPMP_celltype_general")
@@ -502,6 +458,7 @@ metabolic_contrasts_df <- metabolic_contrasts_df %>%
 
 
 ```{r}
+# forest plot of immune score DiD estimates by cell type
 immune_contrasts_df %>%
   ggplot(aes(x = estimate, y = KPMP_celltype_general, color = sig)) +
   geom_vline(xintercept = 0, linetype = "dashed", color = "#adb5bd") +
@@ -518,6 +475,7 @@ immune_contrasts_df %>%
         legend.position = "none") +
   labs(x = "DiD (immune score)", y = NULL)
 
+# forest plot of metabolic score DiD estimates by cell type
 metabolic_contrasts_df %>%
   ggplot(aes(x = estimate, y = KPMP_celltype_general, color = sig)) +
   geom_vline(xintercept = 0, linetype = "dashed", color = "#adb5bd") +
@@ -539,8 +497,6 @@ metabolic_contrasts_df %>%
 # remove cells with ambient RNA (indicated with high expression of PT biomarkers)
 pt_markers <- c("MIOX", "GLYAT", "ALDOB", "GATM", "FABP1", "HPD", "GPX3")
 other_markers <- c("MIOX", "GLYAT", "ALDOB", "GATM", "FABP1", "HPD", "GPX3")
-# FeaturePlot(subset(attempt_so, celltype %in% c("IC-A", "IC-B")), features = pt_markers)
-# FeaturePlot(subset(attempt_so, celltype %in% c("TAL-1", "TAL-2", "TAL-3")), features = pt_markers)
 
 attempt_so <- AddModuleScore(attempt_so, features = list(pt_markers), name = "ambient_score")
 Idents(attempt_so) <- attempt_so$celltype
@@ -569,7 +525,6 @@ samp_split <- lapply(samp_split, run_doubletfinder_custom, multiplet_rate= 0.075
 sglt_dblt_metadata <- data.frame(bind_rows(samp_split)) # merge to a single dataframe
 rownames(sglt_dblt_metadata) <- sglt_dblt_metadata$row_names # assign cell IDs to row names to ensure match
 sglt_dblt_metadata$row_names <- NULL
-head(sglt_dblt_metadata)
 attempt_so <- AddMetaData(attempt_so, sglt_dblt_metadata, col.name = 'doublet_finder')
 
 # Check how doublets singlets differ in QC measures per sample.
@@ -609,12 +564,14 @@ attempt_so <- readRDS(temp_file)
 # All cell types
 
 ```{r echo = F}
+# set factor levels for treatment and visit
 attempt_so$visit <- factor(attempt_so$visit, levels = c("PRE", "POST"))
 attempt_so$treatment <- factor(attempt_so$treatment, levels = c("Placebo", "Dapagliflozin"),
                                   labels = c("Placebo", "Dapagliflozin"))
 ```
 
 ```{r echo = F}
+# create UMAP plots colored by visit, treatment, and cell type
 DimPlot(attempt_so, reduction = "umap.harmony", group.by = "visit", raster = F, alpha = 0.2)
 temp_file <- tempfile(fileext = ".png")
 ggsave(temp_file, width = 10)
@@ -669,13 +626,10 @@ s3$upload_file(temp_file, "attempt", "Figures/attempt_umap_kpmpcelltype.png")
 
 ```
 
-```{r echo = F}
-# umap formatting
-```
-
 #### Proportions (Non weighted)
 
 ```{r echo = F}
+# collapse cell subtypes into broad categories for proportion analysis
 attempt_so$celltype_general <- case_when(
   grepl("PT-", attempt_so$celltype) ~ "PT",
   grepl("TAL-", attempt_so$celltype) ~ "TAL",
@@ -690,9 +644,10 @@ attempt_so$celltype_general <- case_when(
 
 
 
+# extract metadata and set factor levels for plotting
 attempt_meta <- attempt_so@meta.data %>%
   mutate(visit_treatment = paste0(visit, " ", treatment))
-attempt_meta$visit_treatment <- factor(attempt_meta$visit_treatment, 
+attempt_meta$visit_treatment <- factor(attempt_meta$visit_treatment,
                                           levels = c("PRE Placebo", "POST Placebo",
                                                      "PRE Dapagliflozin", "POST Dapagliflozin"))
 attempt_meta$celltype <- factor(attempt_meta$celltype,
@@ -740,11 +695,6 @@ attempt_meta$KPMP_celltype_general <- factor(attempt_meta$KPMP_celltype_general,
                                            "Immune (M)",
                                            "Other"))
 
-# Check counts
-table(attempt_so$celltype_general)
-# Check counts
-table(attempt_so$KPMP_celltype_general)
-length(unique(attempt_so$KPMP_celltype))
 # count the number of cells in the analyzed celltypes
 focus_groups <- list(
   PT = c("PT-S1/S2", "PT-S3", "aPT"),
@@ -752,14 +702,13 @@ focus_groups <- list(
   EC = c("EC-AVR", "EC-GC", "EC-PTC", "EC-AEA", "EC-LYM", "EC/VSMC"),
   IC = c("IC-A", "IC-B", "aIC")
 )
-
-sum(attempt_so$KPMP_celltype %in% unlist(focus_groups)) / ncol(attempt_so)
 ```
 
 ```{r echo = F}
-attempt_meta %>% 
+# bar plots of cell counts and proportions by visit x treatment
+attempt_meta %>%
   filter(!grepl("_", celltype)) %>%
-  ggplot(aes(celltype, fill = visit_treatment)) + 
+  ggplot(aes(celltype, fill = visit_treatment)) +
   geom_bar(stat = "count") +
   theme_classic() +
   labs(x = NULL,
@@ -875,6 +824,7 @@ temp_file <- tempfile(fileext = ".png")
 ggsave(temp_file, height = 10)
 s3$upload_file(temp_file, "attempt", "Figures/attempt_general_cellcounts_proportions_plot.png") 
 
+# compute cell counts per general cell type for annotation labels
 celltype_counts <- attempt_meta %>%
   filter(!grepl("Other", as.character(celltype_general))) %>%
   group_by(celltype_general) %>%
@@ -987,6 +937,7 @@ temp_file <- tempfile(fileext = ".png")
 ggsave(temp_file)
 s3$upload_file(temp_file, "attempt", "Figures/attempt_kpmp_pt_proportions_plot.png") 
 
+# proportion plot for TAL KPMP subtypes
 attempt_meta$kpmp_tal <- case_when(grepl("TAL", attempt_so$KPMP_celltype) ~ attempt_so$KPMP_celltype)
 attempt_meta$kpmp_tal <- factor(attempt_meta$kpmp_tal,
                                 levels = c("aTAL", "dTAL", "C-TAL-1", "C-TAL-2"))
@@ -1017,6 +968,7 @@ s3$upload_file(temp_file, "attempt", "cleaned_data/attempt_meta_proportions.Rdat
 
 
 ```{r echo = F}
+# select top 2000 highly variable genes across all cells
 attempt_so <- FindVariableFeatures(attempt_so, selection.method = "vst", nfeatures = 2000)
 hvgs <- VariableFeatures(attempt_so)
 
@@ -1028,6 +980,7 @@ attempt_so_hvg <- subset(attempt_so, features = hvgs)
 # Descriptive
 
 ```{r echo = F}
+# summarize subject-level demographics by visit x treatment
 unique_attempt_meta <- attempt_meta %>%
   dplyr::select(Subject.ID, Visit, age, Sex, treatment_arm , visit_treatment, diabetes_duration) %>%
   dplyr::mutate(Subject.ID = as.character(Subject.ID, Visit)) %>%
@@ -1040,12 +993,14 @@ summary(arsenal::tableby(visit_treatment ~ age + Sex + diabetes_duration + treat
 
 # PT
 ```{r echo = F}
+# subset to proximal tubule cells
 attempt_so$celltype_pt <- ifelse(grepl("PT-", attempt_so$celltype),
                                  "PT", as.character(attempt_so$celltype))
 attempt_so_pt <- subset(attempt_so, celltype_pt == "PT" & celltype != "PT_lowQuality")
 ```
 
 ```{r echo = F}
+# find HVGs and subset PT cells to top 2000
 attempt_so_pt <- FindVariableFeatures(attempt_so_pt, selection.method = "vst", nfeatures = 2000)
 hvgs_pt <- VariableFeatures(attempt_so_pt)
 
@@ -1056,6 +1011,7 @@ attempt_so_hvg_pt <- subset(attempt_so_pt, features = hvgs_pt)
 
 #### Proportions
 ```{r echo = F, eval = F}
+# stacked bar plots of PT subtype proportions by visit and treatment
 theme_transparent <- theme(
   plot.background   = element_rect(fill = "transparent", color = NA),
   panel.background  = element_rect(fill = "transparent", color = NA),
@@ -1156,7 +1112,7 @@ s3$upload_file(temp_file, "attempt", "Figures/Proportions/attempt_pt_visit_treat
 ```
 
 ```{r echo = F, eval = F}
-# test on proportions using Dirichlet
+# Dirichlet regression on PT subtype proportions by treatment arm
 pt_props <- attempt_meta %>%
   filter(celltype_general %in% c("PT")) %>%
   group_by(subject_id, treatment, visit, celltype) %>%
@@ -1201,7 +1157,7 @@ s3$upload_file(temp_file, "attempt", 'PT/pt_dirichlet_post.rds')
 ```
 
 ```{r echo = F, eval = F}
-# test on proportions using Dirichlet (KPMP celltypes)
+# Dirichlet regression on PT proportions using KPMP cell type labels
 pt_props <- attempt_meta %>%
   filter(KPMP_celltype %in% c("PT-S1/S2", "PT-S3", "aPT")) %>%
   group_by(subject_id, treatment, visit, KPMP_celltype) %>%
@@ -1267,6 +1223,7 @@ res_scDC_noClust$results <- left_join(res_scDC_noClust$results, cond)
 ```
 
 ```{r echo = F}
+# custom barplot and density CI functions for scDC proportion bootstrap results
 barplotCI_custom <- function(res, condition){
   res$results$index_original <- seq_len(nrow(res$results))
   df_toPlot <- res$results %>% 
@@ -1372,130 +1329,11 @@ densityCI_custom(res_scDC_noClust, res_scDC_noClust$results$treatment)
 
 ```
 
-
 ```{r echo = F}
-# lots of non-convergence, long time to compute, and need contrasts to do comparisons between other PT cells other than the ref group (PT-1)
-# # GLM in Placebo only
-# attempt_so_pt_placebo <- subset(attempt_so_pt, treatment == "Placebo")
-# attempt_so_pt_placebo$celltype <- factor(attempt_so_pt_placebo$celltype, levels = c("PT-1", "PT-2", "PT-3", "PT-4", "PT-5"))
-# exprsMat <- GetAssayData(attempt_so_pt_placebo, assay = "RNA", slot = "counts")
-# attempt_so_pt_placebo$treatment_visit <- paste0(attempt_so_pt_placebo$treatment, "_", attempt_so_pt_placebo$visit)
-# attempt_so_pt_placebo$subject_visit <- paste0(attempt_so_pt_placebo$subject_id, "_", attempt_so_pt_placebo$visit)
-# cellTypes <- attempt_so_pt_placebo@meta.data$celltype
-# subject <- attempt_so_pt_placebo@meta.data$subject_visit
-# 
-# cond <- data.frame(subject = subject,
-#                    treatment = attempt_so_pt_placebo@meta.data$treatment_visit,
-#                    visit = attempt_so_pt_placebo@meta.data$visit) %>%
-#   distinct(subject, .keep_all = T)
-# 
-# res_scDC_placebo <- scDC_noClustering(cellTypes, subject, calCI = TRUE, 
-#                                      calCI_method = c("BCa"), ncores = 20, nboot = 1000)
-# 
-# res_scDC_placebo$results$subject <- sub("_.*", "", res_scDC_placebo$results$subject)
-# res_scDC_placebo$info$subject <- sub("_.*", "", res_scDC_placebo$info$subject)
-# cond$subject <- sub("_.*", "", cond$subject)
-# 
-# 
-# res_GLM_placebo <- fitGLM(res_scDC_placebo, cond$visit, 
-#                   pairwise = T)
-# 
-# summary(res_GLM_placebo$pool_res_random)
-```
-
-```{r echo = F}
-# # GLM in Dapa only
-# attempt_so_pt_dapa <- subset(attempt_so_pt, treatment != "Placebo")
-# attempt_so_pt_dapa$celltype <- factor(attempt_so_pt_dapa$celltype, levels = c("PT-1", "PT-2", "PT-3", "PT-4", "PT-5"))
-# exprsMat <- GetAssayData(attempt_so_pt_dapa, assay = "RNA", slot = "counts")
-# attempt_so_pt_dapa$treatment_visit <- paste0(attempt_so_pt_dapa$treatment, "_", attempt_so_pt_dapa$visit)
-# attempt_so_pt_dapa$subject_visit <- paste0(attempt_so_pt_dapa$subject_id, "_", attempt_so_pt_dapa$visit)
-# cellTypes <- attempt_so_pt_dapa@meta.data$celltype
-# subject <- attempt_so_pt_dapa@meta.data$subject_visit
-# 
-# cond <- data.frame(subject = subject,
-#                    treatment = attempt_so_pt_dapa@meta.data$treatment_visit,
-#                    visit = attempt_so_pt_dapa@meta.data$visit) %>%
-#   distinct(subject, .keep_all = T)
-# 
-# res_scDC_dapa <- scDC_noClustering(cellTypes, subject, calCI = TRUE, 
-#                                      calCI_method = c("BCa"), ncores = 20, nboot = 1000)
-# 
-# res_scDC_dapa$results$subject <- sub("_.*", "", res_scDC_dapa$results$subject)
-# res_scDC_dapa$info$subject <- sub("_.*", "", res_scDC_dapa$info$subject)
-# cond$subject <- sub("_.*", "", cond$subject)
-# 
-# 
-# res_GLM_dapa <- fitGLM(res_scDC_dapa, cond$visit, 
-#                   pairwise = T)
-# 
-# summary(res_GLM_dapa$pool_res_random)
-# summary(res_GLM_dapa$pool_res_fixed)
-```
-
-
-```{r echo = F}
-# Method using glmmTMB
-# library(glmmTMB)
-# 
-# # Placebo only
-# attempt_so_pt_meta_placebo <- attempt_so_pt_placebo@meta.data
-# # Loop through PT subtypes
-# pt_subtypes <- paste0("PT-", 1:5)
-# 
-# pt_prop_placebo <- lapply(pt_subtypes, function(pt) {
-#   attempt_so_pt_meta_placebo$binary <- as.integer(attempt_so_pt_meta_placebo$celltype == pt)
-# 
-#   model <- glmmTMB(binary ~ visit + (1 | subject_id), 
-#                    family = binomial(), 
-#                    data = attempt_so_pt_meta_placebo)
-#   
-#   summary_out <- summary(model)
-#   est <- summary_out$coefficients$cond["visitPOST", ]
-#   data.frame(
-#     subtype = pt,
-#     logOR = est["Estimate"],
-#     SE = est["Std. Error"],
-#     p_value = est["Pr(>|z|)"]
-#   )
-# }) %>% bind_rows()
-# 
-# print(pt_prop_placebo)
-```
-
-
-```{r echo = F}
-# attempt_so_pt_meta_dapa <- attempt_so_pt_dapa@meta.data
-# # Loop through PT subtypes
-# pt_subtypes <- paste0("PT-", 1:5)
-# 
-# pt_prop_dapa <- lapply(pt_subtypes, function(pt) {
-#   attempt_so_pt_meta_dapa$binary <- as.integer(attempt_so_pt_meta_dapa$celltype == pt)
-# 
-#   model <- glmmTMB(binary ~ visit + (1 | subject_id), 
-#                    family = binomial(), 
-#                    data = attempt_so_pt_meta_dapa)
-#   
-#   summary_out <- summary(model)
-#   est <- summary_out$coefficients$cond["visitPOST", ]
-#   data.frame(
-#     subtype = pt,
-#     logOR = est["Estimate"],
-#     SE = est["Std. Error"],
-#     p_value = est["Pr(>|z|)"]
-#   )
-# }) %>% bind_rows()
-# 
-# print(pt_prop_dapa)
-
-```
-
-```{r echo = F}
-# using propeller
+# test PT subtype proportion shifts using propeller (logit-transformed proportions + limma)
 library(speckle)
 
 # Placebo
-
 attempt_so_pt_placebo <- subset(attempt_so_pt, treatment == "Placebo")
 attempt_so_pt_placebo$celltype <- factor(attempt_so_pt_placebo$celltype, levels = c("PT-1", "PT-2", "PT-3", "PT-4", "PT-5"))
 attempt_so_pt_meta_placebo <- attempt_so_pt_placebo@meta.data
@@ -1549,9 +1387,8 @@ s3$upload_file(temp_file, "attempt", 'PT/pt_propeller_combined.rds')
 ```
 
 ```{r echo = F}
-# using propeller (KPMP celltype)
+# propeller proportion test using KPMP PT subtypes
 # Placebo
-
 attempt_so_pt_placebo <- subset(attempt_so_pt, treatment == "Placebo")
 attempt_so_pt_placebo$KPMP_celltype <- factor(attempt_so_pt_placebo$KPMP_celltype, levels = c("PT-S1/S2", "PT-S3", "aPT"))
 attempt_so_pt_meta_placebo <- attempt_so_pt_placebo@meta.data
@@ -1664,7 +1501,7 @@ run_mwu_effect_size <- function(meta_df, group_label, celltype = "celltype") {
 ```
 
 ```{r echo = F}
-# For dapagliflozin
+# run MWU proportion tests for PT subtypes in each treatment arm
 effect_results_dapa <- run_mwu_effect_size(attempt_so_pt_meta_dapa, "dapa")
 
 # For placebo (replace this with your placebo meta dataframe)
@@ -1680,7 +1517,7 @@ s3$upload_file(temp_file, "attempt", 'PT/pt_mwu_combined.rds')
 ```
 
 ```{r echo = F}
-# For dapagliflozin
+# run MWU proportion tests using KPMP PT subtypes
 effect_results_dapa_kpmp <- run_mwu_effect_size(attempt_so_pt_meta_dapa, "dapa", celltype = "KPMP_celltype")
 
 # For placebo (replace this with your placebo meta dataframe)
@@ -1696,6 +1533,7 @@ s3$upload_file(temp_file, "attempt", 'PT/pt_mwu_combined_kpmp.rds')
 ```
 
 ```{r echo = F}
+# prepare count matrices for scCODA compositional analysis in Python
 count_df_dapa <- attempt_so_pt_meta_dapa %>%
   group_by(subject_id, visit, sample_id = paste0(subject_id, "_", visit)) %>%
   dplyr::count(celltype) %>%
@@ -1724,12 +1562,10 @@ count_df_placebo = r.count_df_placebo
 count_df_dapa = r.count_df_dapa
 
 # Convert data to anndata object
-print(count_df_placebo)
 data_all = dat.from_pandas(count_df_placebo, covariate_columns=["sample_id"])
 
 # Extract condition from mouse name and add it as an extra column to the covariates
 data_all.obs["visit"] = data_all.obs["subject_id"].str.replace(r"_[0-9]", "", regex=True)
-print(data_all)
 ```
 
 #### Mixed model (hurdle, no nested random effect)
@@ -1739,6 +1575,7 @@ print(data_all)
 ###### REML with rounded counts & pooled offset
 
 ```{r echo = F, eval = F}
+# run NEBULA NBLMM on HVG PT cells for treatment x visit interaction
 nebula_pt_results_list_reml_pooled <- run_nebula_parallel(
   seurat_obj = attempt_so_hvg_pt,
   n_cores = 100,
@@ -1748,7 +1585,7 @@ nebula_pt_results_list_reml_pooled <- run_nebula_parallel(
 ```
 
 ```{r echo = F, eval = F}
-# PT subtypes
+# run NEBULA per PT subtype in parallel (HVG subset)
 celltype_vec <- paste0("PT-", 1:5)
 
 cl <- makeCluster(100)
@@ -1825,13 +1662,14 @@ for (ct in celltype_vec) {
 
 stopCluster(cl)
 overall_end_time <- Sys.time()
-print(overall_end_time - overall_start_time)
+
 ```
 
 
 ###### REML (not reduced to HVG)
 
 ```{r echo = F, eval = T}
+# run NEBULA on all PT genes (not reduced to HVG)
 nebula_pt_results_list_reml_pooled <- run_nebula_parallel(
   seurat_obj = attempt_so_pt,
   n_cores = 100,
@@ -1918,11 +1756,12 @@ for (ct in celltype_vec) {
 
 stopCluster(cl)
 overall_end_time <- Sys.time()
-print(overall_end_time - overall_start_time)
+
 ```
 
 ##### KPMP celltype
 ```{r echo = F}
+# subset to PT cells using KPMP labels (exclude EC-PTC mismap)
 attempt_so$celltype_pt_kpmp <- ifelse(grepl("PT", attempt_so$KPMP_celltype),
                                  "PT", as.character(attempt_so$KPMP_celltype))
 attempt_so_pt_kpmp <- subset(attempt_so, celltype_pt_kpmp == "PT" & KPMP_celltype != "EC-PTC")
@@ -1941,6 +1780,7 @@ attempt_so_hvg_pt_kpmp <- subset(attempt_so_pt_kpmp, features = hvgs_pt_kpmp)
 ###### REML with rounded counts & pooled offset
 
 ```{r echo = F, eval = F}
+# run NEBULA on KPMP PT HVGs
 nebula_pt_kpmp_hvg_results_list_reml_pooled <- run_nebula_parallel(
   seurat_obj = attempt_so_hvg_pt_kpmp,
   n_cores = 100,
@@ -1953,6 +1793,7 @@ nebula_pt_kpmp_hvg_results_list_reml_pooled <- run_nebula_parallel(
 ###### REML (not reduced to HVG)
 
 ```{r echo = F, eval = F}
+# run NEBULA on all KPMP PT genes (not reduced to HVG)
 nebula_pt_kpmp_results_list_reml_pooled <- run_nebula_parallel(
   seurat_obj = attempt_so_pt_kpmp,
   n_cores = 100,
@@ -1973,6 +1814,7 @@ nebula_pt_kpmp_results_list_reml_pooled <- run_nebula_parallel(
 # TAL
 
 ```{r echo = F}
+# subset to thick ascending limb cells
 attempt_so$celltype_tal <- ifelse(grepl("TAL-", attempt_so$celltype),
                                  "TAL", as.character(attempt_so$celltype))
 attempt_so_tal <- subset(attempt_so, celltype_tal == "TAL" & celltype != "TAL_highUMI")
@@ -2098,13 +1940,9 @@ s3$upload_file(temp_file, "attempt", "Figures/Proportions/attempt_tal_visit_trea
 ###### REML with rounded counts & pooled offset
 
 ```{r echo = F, eval = F}
+# run NEBULA NBLMM per gene on TAL HVGs with treatment x visit interaction
 counts_hvg_tal <- round(GetAssayData(attempt_so_hvg_tal, layer = "counts")) # load counts and round
 genes_list <- rownames(counts_hvg_tal)
-
-# meta_hvg_tal <- attempt_so_hvg_tal@meta.data
-# pred = model.matrix(~treatment*visit, data = meta_hvg_tal)
-# data_g_hvg_tal = group_cell(count=counts_hvg_tal, id=meta_hvg_tal$subject, pred=pred)
-# offset_hvg_tal = Matrix::colSums(data_g_hvg_tal$count) 
 
 cl <- makeCluster(100)
 registerDoParallel(cl)
@@ -2152,11 +1990,11 @@ nebula_tal_results_list_reml_pooled <- lapply(nebula_tal_results_list_reml_poole
 nebula_tal_results_list_reml_pooled <- Filter(Negate(is.null), nebula_tal_results_list_reml_pooled)  # remove NULLs first
 
 end_time <- Sys.time()
-print(end_time - start_time)
+
 stopCluster(cl)
 
 nebula_nonconverged_percent <- (length(genes_list)-length(nebula_tal_results_list_reml_pooled))/length(genes_list)
-print(paste0(nebula_nonconverged_percent*100, "% filtered due to low expression"))
+
 temp_file <- tempfile(fileext = "rds") # need to create a temporary file
 saveRDS(nebula_tal_results_list_reml_pooled, temp_file) # save the temp file locally (will delete after R session)
 s3$upload_file(temp_file, "attempt", 'TAL/nebula/tal_attempt_hvg_nebula_res_reml_pooled.rds')
@@ -2240,19 +2078,15 @@ for (ct in celltype_vec) {
 
 stopCluster(cl)
 overall_end_time <- Sys.time()
-print(overall_end_time - overall_start_time)
+
 ```
 
 ###### REML (not reduced to HVG)
 
 ```{r echo = F, eval = T}
+# run NEBULA NBLMM per gene on all TAL genes (not reduced to HVG)
 counts_tal <- round(GetAssayData(attempt_so_tal, layer = "counts")) # load counts and round
 genes_list <- rownames(counts_tal)
-
-# meta_tal <- attempt_so_tal@meta.data
-# pred = model.matrix(~treatment*visit, data = meta_tal)
-# data_g_tal = group_cell(count=counts_tal, id=meta_tal$subject, pred=pred)
-# offset_tal = Matrix::colSums(data_g_tal$count) 
 
 cl <- makeCluster(100)
 registerDoParallel(cl)
@@ -2300,11 +2134,11 @@ nebula_tal_results_list_reml_pooled <- lapply(nebula_tal_results_list_reml_poole
 nebula_tal_results_list_reml_pooled <- Filter(Negate(is.null), nebula_tal_results_list_reml_pooled)  # remove NULLs first
 
 end_time <- Sys.time()
-print(end_time - start_time)
+
 stopCluster(cl)
 
 nebula_nonconverged_percent <- (length(genes_list)-length(nebula_tal_results_list_reml_pooled))/length(genes_list)
-print(paste0(nebula_nonconverged_percent*100, "% filtered due to low expression"))
+
 temp_file <- tempfile(fileext = "rds") # need to create a temporary file
 saveRDS(nebula_tal_results_list_reml_pooled, temp_file) # save the temp file locally (will delete after R session)
 s3$upload_file(temp_file, "attempt", 'TAL/nebula/tal_attempt_nebula_res_reml_pooled.rds')
@@ -2388,15 +2222,15 @@ for (ct in celltype_vec) {
 
 stopCluster(cl)
 overall_end_time <- Sys.time()
-print(overall_end_time - overall_start_time)
+
 ```
 
 ##### KPMP celltype
 
 ```{r echo = F}
+# subset to TAL cells using KPMP labels
 attempt_so$celltype_tal_kpmp <- ifelse(grepl("TAL", attempt_so$KPMP_celltype),
                                  "TAL", as.character(attempt_so$KPMP_celltype))
-unique(subset(attempt_so, celltype_tal_kpmp == "TAL")$KPMP_celltype)
 attempt_so_tal_kpmp <- subset(attempt_so, celltype_tal_kpmp == "TAL" & KPMP_celltype != "EC-PTC")
 ```
 
@@ -2413,6 +2247,7 @@ attempt_so_hvg_tal_kpmp <- subset(attempt_so_tal_kpmp, features = hvgs_tal_kpmp)
 ###### REML with rounded counts & pooled offset
 
 ```{r echo = F, eval = F}
+# run NEBULA on KPMP TAL HVGs
 nebula_tal_kpmp_hvg_results_list_reml_pooled <- run_nebula_parallel(
   seurat_obj = attempt_so_hvg_tal_kpmp,
   n_cores = 100,
@@ -2424,6 +2259,7 @@ nebula_tal_kpmp_hvg_results_list_reml_pooled <- run_nebula_parallel(
 ###### REML (not reduced to HVG)
 
 ```{r echo = F, eval = F}
+# run NEBULA on all KPMP TAL genes
 nebula_tal_kpmp_results_list_reml_pooled <- run_nebula_parallel(
   seurat_obj = attempt_so_tal_kpmp,
   n_cores = 100,
@@ -2513,13 +2349,9 @@ s3$upload_file(temp_file, "attempt", "Figures/Proportions/attempt_immune_treatme
 ###### REML with rounded counts & pooled offset
 
 ```{r echo = F, eval = F}
+# run NEBULA NBLMM per gene on immune HVGs
 counts_hvg_immune <- round(GetAssayData(attempt_so_hvg_immune, layer = "counts")) # load counts and round
 genes_list <- rownames(counts_hvg_immune)
-
-# meta_hvg_immune <- attempt_so_hvg_immune@meta.data
-# pred = model.matrix(~treatment*visit, data = meta_hvg_immune)
-# data_g_hvg_immune = group_cell(count=counts_hvg_immune, id=meta_hvg_immune$subject, pred=pred)
-# offset_hvg_immune = Matrix::colSums(data_g_hvg_immune$count) 
 
 cl <- makeCluster(100)
 registerDoParallel(cl)
@@ -2567,11 +2399,11 @@ nebula_immune_results_list_reml_pooled <- lapply(nebula_immune_results_list_reml
 nebula_immune_results_list_reml_pooled <- Filter(Negate(is.null), nebula_immune_results_list_reml_pooled)  # remove NULLs first
 
 end_time <- Sys.time()
-print(end_time - start_time)
+
 stopCluster(cl)
 
 nebula_nonconverged_percent <- (length(genes_list)-length(nebula_immune_results_list_reml_pooled))/length(genes_list)
-print(paste0(nebula_nonconverged_percent*100, "% filtered due to low expression"))
+
 temp_file <- tempfile(fileext = "rds") # need to create a temporary file
 saveRDS(nebula_immune_results_list_reml_pooled, temp_file) # save the temp file locally (will delete after R session)
 s3$upload_file(temp_file, "attempt", 'Immune/nebula/immune_attempt_hvg_nebula_res_reml_pooled.rds')
@@ -2580,13 +2412,9 @@ s3$upload_file(temp_file, "attempt", 'Immune/nebula/immune_attempt_hvg_nebula_re
 ###### REML (not reduced to HVG)
 
 ```{r echo = F, eval = T}
+# run NEBULA on all immune genes (not reduced to HVG)
 counts_immune <- round(GetAssayData(attempt_so_immune, layer = "counts")) # load counts and round
 genes_list <- rownames(counts_immune)
-
-# meta_immune <- attempt_so_immune@meta.data
-# pred = model.matrix(~treatment*visit, data = meta_immune)
-# data_g_immune = group_cell(count=counts_immune, id=meta_immune$subject, pred=pred)
-# offset_immune = Matrix::colSums(data_g_immune$count) 
 
 cl <- makeCluster(100)
 registerDoParallel(cl)
@@ -2634,11 +2462,11 @@ nebula_immune_results_list_reml_pooled <- lapply(nebula_immune_results_list_reml
 nebula_immune_results_list_reml_pooled <- Filter(Negate(is.null), nebula_immune_results_list_reml_pooled)  # remove NULLs first
 
 end_time <- Sys.time()
-print(end_time - start_time)
+
 stopCluster(cl)
 
 nebula_nonconverged_percent <- (length(genes_list)-length(nebula_immune_results_list_reml_pooled))/length(genes_list)
-print(paste0(nebula_nonconverged_percent*100, "% filtered due to low expression"))
+
 temp_file <- tempfile(fileext = "rds") # need to create a temporary file
 saveRDS(nebula_immune_results_list_reml_pooled, temp_file) # save the temp file locally (will delete after R session)
 s3$upload_file(temp_file, "attempt", 'Immune/nebula/immune_attempt_nebula_res_reml_pooled.rds')
@@ -2648,9 +2476,9 @@ s3$upload_file(temp_file, "attempt", 'Immune/nebula/immune_attempt_nebula_res_re
 ##### KPMP celltype
 
 ```{r echo = F}
+# subset to immune cells using KPMP labels
 attempt_so$celltype_immune_kpmp <- ifelse(grepl("TAL", attempt_so$KPMP_celltype),
                                  "TAL", as.character(attempt_so$KPMP_celltype))
-unique(subset(attempt_so, celltype_immune_kpmp == "TAL")$KPMP_celltype)
 attempt_so_immune_kpmp <- subset(attempt_so, celltype_immune_kpmp == "TAL" & KPMP_celltype != "EC-PTC")
 ```
 
@@ -2667,6 +2495,7 @@ attempt_so_hvg_immune_kpmp <- subset(attempt_so_immune_kpmp, features = hvgs_imm
 ###### REML with rounded counts & pooled offset
 
 ```{r echo = F, eval = F}
+# run NEBULA on KPMP immune HVGs
 nebula_immune_kpmp_hvg_results_list_reml_pooled <- run_nebula_parallel(
   seurat_obj = attempt_so_hvg_immune_kpmp,
   n_cores = 100,
@@ -2678,6 +2507,7 @@ nebula_immune_kpmp_hvg_results_list_reml_pooled <- run_nebula_parallel(
 ###### REML (not reduced to HVG)
 
 ```{r echo = F, eval = F}
+# run NEBULA on all KPMP immune genes
 nebula_immune_kpmp_results_list_reml_pooled <- run_nebula_parallel(
   seurat_obj = attempt_so_immune_kpmp,
   n_cores = 100,
@@ -2715,13 +2545,9 @@ attempt_so_hvg_immune_myeloid <- subset(attempt_so_immune_myeloid, features = hv
 ###### REML with rounded counts & pooled offset
 
 ```{r echo = F, eval = F}
+# run NEBULA NBLMM per gene on myeloid immune HVGs
 counts_hvg_immune_myeloid <- round(GetAssayData(attempt_so_hvg_immune_myeloid, layer = "counts")) # load counts and round
 genes_list <- rownames(counts_hvg_immune_myeloid)
-
-# meta_hvg_immune_myeloid <- attempt_so_hvg_immune_myeloid@meta.data
-# pred = model.matrix(~treatment*visit, data = meta_hvg_immune_myeloid)
-# data_g_hvg_immune_myeloid = group_cell(count=counts_hvg_immune_myeloid, id=meta_hvg_immune_myeloid$subject, pred=pred)
-# offset_hvg_immune_myeloid = Matrix::colSums(data_g_hvg_immune_myeloid$count) 
 
 cl <- makeCluster(100)
 registerDoParallel(cl)
@@ -2769,11 +2595,11 @@ nebula_immune_myeloid_results_list_reml_pooled <- lapply(nebula_immune_myeloid_r
 nebula_immune_myeloid_results_list_reml_pooled <- Filter(Negate(is.null), nebula_immune_myeloid_results_list_reml_pooled)  # remove NULLs first
 
 end_time <- Sys.time()
-print(end_time - start_time)
+
 stopCluster(cl)
 
 nebula_nonconverged_percent <- (length(genes_list)-length(nebula_immune_myeloid_results_list_reml_pooled))/length(genes_list)
-print(paste0(nebula_nonconverged_percent*100, "% filtered due to low expression"))
+
 temp_file <- tempfile(fileext = "rds") # need to create a temporary file
 saveRDS(nebula_immune_myeloid_results_list_reml_pooled, temp_file) # save the temp file locally (will delete after R session)
 s3$upload_file(temp_file, "attempt", 'Immune_Myeloid/nebula/immune_myeloid_attempt_hvg_nebula_res_reml_pooled.rds')
@@ -2858,19 +2684,15 @@ for (ct in celltype_vec) {
 
 stopCluster(cl)
 overall_end_time <- Sys.time()
-print(overall_end_time - overall_start_time)
+
 ```
 
 ###### REML (not reduced to HVG)
 
 ```{r echo = F, eval = T}
+# run NEBULA on all myeloid immune genes
 counts_immune_myeloid <- round(GetAssayData(attempt_so_immune_myeloid, layer = "counts")) # load counts and round
 genes_list <- rownames(counts_immune_myeloid)
-
-# meta_immune_myeloid <- attempt_so_immune_myeloid@meta.data
-# pred = model.matrix(~treatment*visit, data = meta_immune_myeloid)
-# data_g_immune_myeloid = group_cell(count=counts_immune_myeloid, id=meta_immune_myeloid$subject, pred=pred)
-# offset_immune_myeloid = Matrix::colSums(data_g_immune_myeloid$count) 
 
 cl <- makeCluster(100)
 registerDoParallel(cl)
@@ -2918,11 +2740,11 @@ nebula_immune_myeloid_results_list_reml_pooled <- lapply(nebula_immune_myeloid_r
 nebula_immune_myeloid_results_list_reml_pooled <- Filter(Negate(is.null), nebula_immune_myeloid_results_list_reml_pooled)  # remove NULLs first
 
 end_time <- Sys.time()
-print(end_time - start_time)
+
 stopCluster(cl)
 
 nebula_nonconverged_percent <- (length(genes_list)-length(nebula_immune_myeloid_results_list_reml_pooled))/length(genes_list)
-print(paste0(nebula_nonconverged_percent*100, "% filtered due to low expression"))
+
 temp_file <- tempfile(fileext = "rds") # need to create a temporary file
 saveRDS(nebula_immune_myeloid_results_list_reml_pooled, temp_file) # save the temp file locally (will delete after R session)
 s3$upload_file(temp_file, "attempt", 'Immune_Myeloid/nebula/immune_myeloid_attempt_nebula_res_reml_pooled.rds')
@@ -3007,7 +2829,7 @@ for (ct in celltype_vec) {
 
 stopCluster(cl)
 overall_end_time <- Sys.time()
-print(overall_end_time - overall_start_time)
+
 ```
 
 
@@ -3035,13 +2857,9 @@ attempt_so_hvg_immune_lymphoid <- subset(attempt_so_immune_lymphoid, features = 
 ###### REML with rounded counts & pooled offset
 
 ```{r echo = F, eval = F}
+# run NEBULA NBLMM per gene on lymphoid immune HVGs
 counts_hvg_immune_lymphoid <- round(GetAssayData(attempt_so_hvg_immune_lymphoid, layer = "counts")) # load counts and round
 genes_list <- rownames(counts_hvg_immune_lymphoid)
-
-# meta_hvg_immune_lymphoid <- attempt_so_hvg_immune_lymphoid@meta.data
-# pred = model.matrix(~treatment*visit, data = meta_hvg_immune_lymphoid)
-# data_g_hvg_immune_lymphoid = group_cell(count=counts_hvg_immune_lymphoid, id=meta_hvg_immune_lymphoid$subject, pred=pred)
-# offset_hvg_immune_lymphoid = Matrix::colSums(data_g_hvg_immune_lymphoid$count) 
 
 cl <- makeCluster(100)
 registerDoParallel(cl)
@@ -3089,11 +2907,11 @@ nebula_immune_lymphoid_results_list_reml_pooled <- lapply(nebula_immune_lymphoid
 nebula_immune_lymphoid_results_list_reml_pooled <- Filter(Negate(is.null), nebula_immune_lymphoid_results_list_reml_pooled)  # remove NULLs first
 
 end_time <- Sys.time()
-print(end_time - start_time)
+
 stopCluster(cl)
 
 nebula_nonconverged_percent <- (length(genes_list)-length(nebula_immune_lymphoid_results_list_reml_pooled))/length(genes_list)
-print(paste0(nebula_nonconverged_percent*100, "% filtered due to low expression"))
+
 temp_file <- tempfile(fileext = "rds") # need to create a temporary file
 saveRDS(nebula_immune_lymphoid_results_list_reml_pooled, temp_file) # save the temp file locally (will delete after R session)
 s3$upload_file(temp_file, "attempt", 'Immune_Lymphoid/nebula/immune_lymphoid_attempt_hvg_nebula_res_reml_pooled.rds')
@@ -3177,20 +2995,16 @@ for (ct in celltype_vec) {
 
 stopCluster(cl)
 overall_end_time <- Sys.time()
-print(overall_end_time - overall_start_time)
+
 ```
 
 
 ###### REML (not reduced to HVG)
 
 ```{r echo = F, eval = T}
+# run NEBULA on all lymphoid immune genes
 counts_immune_lymphoid <- round(GetAssayData(attempt_so_immune_lymphoid, layer = "counts")) # load counts and round
 genes_list <- rownames(counts_immune_lymphoid)
-
-# meta_immune_lymphoid <- attempt_so_immune_lymphoid@meta.data
-# pred = model.matrix(~treatment*visit, data = meta_immune_lymphoid)
-# data_g_immune_lymphoid = group_cell(count=counts_immune_lymphoid, id=meta_immune_lymphoid$subject, pred=pred)
-# offset_immune_lymphoid = Matrix::colSums(data_g_immune_lymphoid$count) 
 
 cl <- makeCluster(100)
 registerDoParallel(cl)
@@ -3238,11 +3052,11 @@ nebula_immune_lymphoid_results_list_reml_pooled <- lapply(nebula_immune_lymphoid
 nebula_immune_lymphoid_results_list_reml_pooled <- Filter(Negate(is.null), nebula_immune_lymphoid_results_list_reml_pooled)  # remove NULLs first
 
 end_time <- Sys.time()
-print(end_time - start_time)
+
 stopCluster(cl)
 
 nebula_nonconverged_percent <- (length(genes_list)-length(nebula_immune_lymphoid_results_list_reml_pooled))/length(genes_list)
-print(paste0(nebula_nonconverged_percent*100, "% filtered due to low expression"))
+
 temp_file <- tempfile(fileext = "rds") # need to create a temporary file
 saveRDS(nebula_immune_lymphoid_results_list_reml_pooled, temp_file) # save the temp file locally (will delete after R session)
 s3$upload_file(temp_file, "attempt", 'Immune_Lymphoid/nebula/immune_lymphoid_attempt_nebula_res_reml_pooled.rds')
@@ -3326,7 +3140,7 @@ for (ct in celltype_vec) {
 
 stopCluster(cl)
 overall_end_time <- Sys.time()
-print(overall_end_time - overall_start_time)
+
 ```
 # PC 
 
@@ -3408,13 +3222,9 @@ s3$upload_file(temp_file, "attempt", "Figures/Proportions/attempt_pc_treatment_v
 ###### REML with rounded counts & pooled offset
 
 ```{r echo = F, eval = F}
+# run NEBULA NBLMM per gene on PC HVGs
 counts_hvg_pc <- round(GetAssayData(attempt_so_hvg_pc, layer = "counts")) # load counts and round
 genes_list <- rownames(counts_hvg_pc)
-
-# meta_hvg_pc <- attempt_so_hvg_pc@meta.data
-# pred = model.matrix(~treatment*visit, data = meta_hvg_pc)
-# data_g_hvg_pc = group_cell(count=counts_hvg_pc, id=meta_hvg_pc$subject, pred=pred)
-# offset_hvg_pc = Matrix::colSums(data_g_hvg_pc$count) 
 
 cl <- makeCluster(100)
 registerDoParallel(cl)
@@ -3462,11 +3272,11 @@ nebula_pc_results_list_reml_pooled <- lapply(nebula_pc_results_list_reml_pooled,
 nebula_pc_results_list_reml_pooled <- Filter(Negate(is.null), nebula_pc_results_list_reml_pooled)  # remove NULLs first
 
 end_time <- Sys.time()
-print(end_time - start_time)
+
 stopCluster(cl)
 
 nebula_nonconverged_percent <- (length(genes_list)-length(nebula_pc_results_list_reml_pooled))/length(genes_list)
-print(paste0(nebula_nonconverged_percent*100, "% filtered due to low expression"))
+
 temp_file <- tempfile(fileext = "rds") # need to create a temporary file
 saveRDS(nebula_pc_results_list_reml_pooled, temp_file) # save the temp file locally (will delete after R session)
 s3$upload_file(temp_file, "attempt", 'PC/nebula/pc_attempt_hvg_nebula_res_reml_pooled.rds')
@@ -3551,19 +3361,15 @@ for (ct in celltype_vec) {
 
 stopCluster(cl)
 overall_end_time <- Sys.time()
-print(overall_end_time - overall_start_time)
+
 ```
 
 ###### REML (not reduced to HVG)
 
 ```{r echo = F, eval = T}
+# run NEBULA on all PC genes
 counts_pc <- round(GetAssayData(attempt_so_pc, layer = "counts")) # load counts and round
 genes_list <- rownames(counts_pc)
-
-# meta_pc <- attempt_so_pc@meta.data
-# pred = model.matrix(~treatment*visit, data = meta_pc)
-# data_g_pc = group_cell(count=counts_pc, id=meta_pc$subject, pred=pred)
-# offset_pc = Matrix::colSums(data_g_pc$count) 
 
 cl <- makeCluster(100)
 registerDoParallel(cl)
@@ -3611,11 +3417,11 @@ nebula_pc_results_list_reml_pooled <- lapply(nebula_pc_results_list_reml_pooled,
 nebula_pc_results_list_reml_pooled <- Filter(Negate(is.null), nebula_pc_results_list_reml_pooled)  # remove NULLs first
 
 end_time <- Sys.time()
-print(end_time - start_time)
+
 stopCluster(cl)
 
 nebula_nonconverged_percent <- (length(genes_list)-length(nebula_pc_results_list_reml_pooled))/length(genes_list)
-print(paste0(nebula_nonconverged_percent*100, "% filtered due to low expression"))
+
 temp_file <- tempfile(fileext = "rds") # need to create a temporary file
 saveRDS(nebula_pc_results_list_reml_pooled, temp_file) # save the temp file locally (will delete after R session)
 s3$upload_file(temp_file, "attempt", 'PC/nebula/pc_attempt_nebula_res_reml_pooled.rds')
@@ -3700,7 +3506,7 @@ for (ct in celltype_vec) {
 
 stopCluster(cl)
 overall_end_time <- Sys.time()
-print(overall_end_time - overall_start_time)
+
 ```
 
 
@@ -3789,13 +3595,9 @@ s3$upload_file(temp_file, "attempt", "Figures/Proportions/attempt_ic_treatment_v
 ###### REML with rounded counts & pooled offset
 
 ```{r echo = F, eval = F}
+# run NEBULA NBLMM per gene on IC HVGs
 counts_hvg_ic <- round(GetAssayData(attempt_so_hvg_ic, layer = "counts")) # load counts and round
 genes_list <- rownames(counts_hvg_ic)
-
-# meta_hvg_ic <- attempt_so_hvg_ic@meta.data
-# pred = model.matrix(~treatment*visit, data = meta_hvg_ic)
-# data_g_hvg_ic = group_cell(count=counts_hvg_ic, id=meta_hvg_ic$subject, pred=pred)
-# offset_hvg_ic = Matrix::colSums(data_g_hvg_ic$count) 
 
 cl <- makeCluster(100)
 registerDoParallel(cl)
@@ -3843,11 +3645,11 @@ nebula_ic_results_list_reml_pooled <- lapply(nebula_ic_results_list_reml_pooled,
 nebula_ic_results_list_reml_pooled <- Filter(Negate(is.null), nebula_ic_results_list_reml_pooled)  # remove NULLs first
 
 end_time <- Sys.time()
-print(end_time - start_time)
+
 stopCluster(cl)
 
 nebula_nonconverged_percent <- (length(genes_list)-length(nebula_ic_results_list_reml_pooled))/length(genes_list)
-print(paste0(nebula_nonconverged_percent*100, "% filtered due to low expression"))
+
 temp_file <- tempfile(fileext = "rds") # need to create a temporary file
 saveRDS(nebula_ic_results_list_reml_pooled, temp_file) # save the temp file locally (will delete after R session)
 s3$upload_file(temp_file, "attempt", 'IC/nebula/ic_attempt_hvg_nebula_res_reml_pooled.rds')
@@ -3931,19 +3733,15 @@ for (ct in celltype_vec) {
 
 stopCluster(cl)
 overall_end_time <- Sys.time()
-print(overall_end_time - overall_start_time)
+
 ```
 
 ###### REML (not reduced to HVG)
 
 ```{r echo = F, eval = T}
+# run NEBULA on all IC genes
 counts_ic <- round(GetAssayData(attempt_so_ic, layer = "counts")) # load counts and round
 genes_list <- rownames(counts_ic)
-
-# meta_ic <- attempt_so_ic@meta.data
-# pred = model.matrix(~treatment*visit, data = meta_ic)
-# data_g_ic = group_cell(count=counts_ic, id=meta_ic$subject, pred=pred)
-# offset_ic = Matrix::colSums(data_g_ic$count) 
 
 cl <- makeCluster(100)
 registerDoParallel(cl)
@@ -3991,11 +3789,11 @@ nebula_ic_results_list_reml_pooled <- lapply(nebula_ic_results_list_reml_pooled,
 nebula_ic_results_list_reml_pooled <- Filter(Negate(is.null), nebula_ic_results_list_reml_pooled)  # remove NULLs first
 
 end_time <- Sys.time()
-print(end_time - start_time)
+
 stopCluster(cl)
 
 nebula_nonconverged_percent <- (length(genes_list)-length(nebula_ic_results_list_reml_pooled))/length(genes_list)
-print(paste0(nebula_nonconverged_percent*100, "% filtered due to low expression"))
+
 temp_file <- tempfile(fileext = "rds") # need to create a temporary file
 saveRDS(nebula_ic_results_list_reml_pooled, temp_file) # save the temp file locally (will delete after R session)
 s3$upload_file(temp_file, "attempt", 'IC/nebula/ic_attempt_nebula_res_reml_pooled.rds')
@@ -4079,7 +3877,7 @@ for (ct in celltype_vec) {
 
 stopCluster(cl)
 overall_end_time <- Sys.time()
-print(overall_end_time - overall_start_time)
+
 ```
 
 #### Average expression (pseudo-bulk within individual)
@@ -4089,6 +3887,7 @@ print(overall_end_time - overall_start_time)
 # EC
 
 ```{r echo = F}
+# subset to endothelial cells
 attempt_so$celltype_ec <- ifelse(attempt_so$celltype %in% c("EC-PTC", "EC-GC", "EC-AEA", "EC-LYM"),
                                      "EC", as.character(attempt_so$celltype))
 attempt_so_ec <- subset(attempt_so, celltype_ec == "EC")
@@ -4165,13 +3964,9 @@ s3$upload_file(temp_file, "attempt", "Figures/Proportions/attempt_ec_treatment_v
 ###### REML with rounded counts & pooled offset
 
 ```{r echo = F, eval = F}
+# run NEBULA NBLMM per gene on EC HVGs
 counts_hvg_ec <- round(GetAssayData(attempt_so_hvg_ec, layer = "counts")) # load counts and round
 genes_list <- rownames(counts_hvg_ec)
-
-# meta_hvg_ec <- attempt_so_hvg_ec@meta.data
-# pred = model.matrix(~treatment*visit, data = meta_hvg_ec)
-# data_g_hvg_ec = group_cell(count=counts_hvg_ec, id=meta_hvg_ec$subject, pred=pred)
-# offset_hvg_ec = Matrix::colSums(data_g_hvg_ec$count) 
 
 cl <- makeCluster(100)
 registerDoParallel(cl)
@@ -4219,11 +4014,11 @@ nebula_ec_results_list_reml_pooled <- lapply(nebula_ec_results_list_reml_pooled,
 nebula_ec_results_list_reml_pooled <- Filter(Negate(is.null), nebula_ec_results_list_reml_pooled)  # remove NULLs first
 
 end_time <- Sys.time()
-print(end_time - start_time)
+
 stopCluster(cl)
 
 nebula_nonconverged_percent <- (length(genes_list)-length(nebula_ec_results_list_reml_pooled))/length(genes_list)
-print(paste0(nebula_nonconverged_percent*100, "% filtered due to low expression"))
+
 temp_file <- tempfile(fileext = "rds") # need to create a temporary file
 saveRDS(nebula_ec_results_list_reml_pooled, temp_file) # save the temp file locally (will delete after R session)
 s3$upload_file(temp_file, "attempt", 'EC/nebula/ec_attempt_hvg_nebula_res_reml_pooled.rds')
@@ -4308,19 +4103,15 @@ for (ct in celltype_vec) {
 
 stopCluster(cl)
 overall_end_time <- Sys.time()
-print(overall_end_time - overall_start_time)
+
 ```
 
 ###### REML (not reduced to HVG)
 
 ```{r echo = F, eval = T}
+# run NEBULA on all EC genes
 counts_ec <- round(GetAssayData(attempt_so_ec, layer = "counts")) # load counts and round
 genes_list <- rownames(counts_ec)
-
-# meta_ec <- attempt_so_ec@meta.data
-# pred = model.matrix(~treatment*visit, data = meta_ec)
-# data_g_ec = group_cell(count=counts_ec, id=meta_ec$subject, pred=pred)
-# offset_ec = Matrix::colSums(data_g_ec$count) 
 
 cl <- makeCluster(100)
 registerDoParallel(cl)
@@ -4368,11 +4159,11 @@ nebula_ec_results_list_reml_pooled <- lapply(nebula_ec_results_list_reml_pooled,
 nebula_ec_results_list_reml_pooled <- Filter(Negate(is.null), nebula_ec_results_list_reml_pooled)  # remove NULLs first
 
 end_time <- Sys.time()
-print(end_time - start_time)
+
 stopCluster(cl)
 
 nebula_nonconverged_percent <- (length(genes_list)-length(nebula_ec_results_list_reml_pooled))/length(genes_list)
-print(paste0(nebula_nonconverged_percent*100, "% filtered due to low expression"))
+
 temp_file <- tempfile(fileext = "rds") # need to create a temporary file
 saveRDS(nebula_ec_results_list_reml_pooled, temp_file) # save the temp file locally (will delete after R session)
 s3$upload_file(temp_file, "attempt", 'EC/nebula/ec_attempt_nebula_res_reml_pooled.rds')
@@ -4457,7 +4248,7 @@ for (ct in celltype_vec) {
 
 stopCluster(cl)
 overall_end_time <- Sys.time()
-print(overall_end_time - overall_start_time)
+
 ```
 
 #### Average expression (pseudo-bulk within individual)
@@ -4467,6 +4258,7 @@ print(overall_end_time - overall_start_time)
 # FIB, VSMC/P
 
 ```{r echo = F}
+# subset to fibroblast and vascular smooth muscle cells
 attempt_so$celltype_fibvsmc <- ifelse(attempt_so$celltype %in% c("FIB", "VSMC/P"),
                                      "FIBVSMC", as.character(attempt_so$celltype))
 attempt_so_fibvsmc <- subset(attempt_so, celltype_fibvsmc == "FIBVSMC")
@@ -4543,13 +4335,9 @@ s3$upload_file(temp_file, "attempt", "Figures/Proportions/attempt_fibvsmc_treatm
 ###### REML with rounded counts & pooled offset
 
 ```{r echo = F, eval = F}
+# run NEBULA NBLMM per gene on FIB/VSMC HVGs
 counts_hvg_fibvsmc <- round(GetAssayData(attempt_so_hvg_fibvsmc, layer = "counts")) # load counts and round
 genes_list <- rownames(counts_hvg_fibvsmc)
-
-# meta_hvg_fibvsmc <- attempt_so_hvg_fibvsmc@meta.data
-# pred = model.matrix(~treatment*visit, data = meta_hvg_fibvsmc)
-# data_g_hvg_fibvsmc = group_cell(count=counts_hvg_fibvsmc, id=meta_hvg_fibvsmc$subject, pred=pred)
-# offset_hvg_fibvsmc = Matrix::colSums(data_g_hvg_fibvsmc$count) 
 
 cl <- makeCluster(100)
 registerDoParallel(cl)
@@ -4597,11 +4385,11 @@ nebula_fibvsmc_results_list_reml_pooled <- lapply(nebula_fibvsmc_results_list_re
 nebula_fibvsmc_results_list_reml_pooled <- Filter(Negate(is.null), nebula_fibvsmc_results_list_reml_pooled)  # remove NULLs first
 
 end_time <- Sys.time()
-print(end_time - start_time)
+
 stopCluster(cl)
 
 nebula_nonconverged_percent <- (length(genes_list)-length(nebula_fibvsmc_results_list_reml_pooled))/length(genes_list)
-print(paste0(nebula_nonconverged_percent*100, "% filtered due to low expression"))
+
 temp_file <- tempfile(fileext = "rds") # need to create a temporary file
 saveRDS(nebula_fibvsmc_results_list_reml_pooled, temp_file) # save the temp file locally (will delete after R session)
 s3$upload_file(temp_file, "attempt", 'FIBVSMCP/nebula/fibvsmc_attempt_hvg_nebula_res_reml_pooled.rds')
@@ -4686,19 +4474,15 @@ for (ct in celltype_vec) {
 
 stopCluster(cl)
 overall_end_time <- Sys.time()
-print(overall_end_time - overall_start_time)
+
 ```
 
 ###### REML with rounded counts & pooled offset
 
 ```{r echo = F, eval = T}
+# run NEBULA on all FIB/VSMC genes
 counts_fibvsmc <- round(GetAssayData(attempt_so_fibvsmc, layer = "counts")) # load counts and round
 genes_list <- rownames(counts_fibvsmc)
-
-# meta_fibvsmc <- attempt_so_fibvsmc@meta.data
-# pred = model.matrix(~treatment*visit, data = meta_fibvsmc)
-# data_g_fibvsmc = group_cell(count=counts_fibvsmc, id=meta_fibvsmc$subject, pred=pred)
-# offset_fibvsmc = Matrix::colSums(data_g_fibvsmc$count) 
 
 cl <- makeCluster(100)
 registerDoParallel(cl)
@@ -4746,11 +4530,11 @@ nebula_fibvsmc_results_list_reml_pooled <- lapply(nebula_fibvsmc_results_list_re
 nebula_fibvsmc_results_list_reml_pooled <- Filter(Negate(is.null), nebula_fibvsmc_results_list_reml_pooled)  # remove NULLs first
 
 end_time <- Sys.time()
-print(end_time - start_time)
+
 stopCluster(cl)
 
 nebula_nonconverged_percent <- (length(genes_list)-length(nebula_fibvsmc_results_list_reml_pooled))/length(genes_list)
-print(paste0(nebula_nonconverged_percent*100, "% filtered due to low expression"))
+
 temp_file <- tempfile(fileext = "rds") # need to create a temporary file
 saveRDS(nebula_fibvsmc_results_list_reml_pooled, temp_file) # save the temp file locally (will delete after R session)
 s3$upload_file(temp_file, "attempt", 'FIBVSMCP/nebula/fibvsmc_attempt_nebula_res_reml_pooled.rds')
@@ -4835,7 +4619,7 @@ for (ct in celltype_vec) {
 
 stopCluster(cl)
 overall_end_time <- Sys.time()
-print(overall_end_time - overall_start_time)
+
 ```
 
 #### Average expression (pseudo-bulk within individual)
@@ -4846,6 +4630,7 @@ print(overall_end_time - overall_start_time)
 # POD
 
 ```{r echo = F}
+# subset to podocytes
 attempt_so$celltype_pod <- ifelse(attempt_so$celltype %in% c("POD"),
                                      "POD", as.character(attempt_so$celltype))
 attempt_so_pod <- subset(attempt_so, celltype_pod == "POD")
@@ -4922,13 +4707,9 @@ s3$upload_file(temp_file, "attempt", "Figures/Proportions/attempt_pod_treatment_
 ###### REML with rounded counts & pooled offset
 
 ```{r echo = F, eval = T}
+# run NEBULA NBLMM per gene on POD HVGs
 counts_hvg_pod <- round(GetAssayData(attempt_so_hvg_pod, layer = "counts")) # load counts and round
 genes_list <- rownames(counts_hvg_pod)
-
-# meta_hvg_pod <- attempt_so_hvg_pod@meta.data
-# pred = model.matrix(~treatment*visit, data = meta_hvg_pod)
-# data_g_hvg_pod = group_cell(count=counts_hvg_pod, id=meta_hvg_pod$subject, pred=pred)
-# offset_hvg_pod = Matrix::colSums(data_g_hvg_pod$count) 
 
 cl <- makeCluster(100)
 registerDoParallel(cl)
@@ -4976,11 +4757,11 @@ nebula_pod_results_list_reml_pooled <- lapply(nebula_pod_results_list_reml_poole
 nebula_pod_results_list_reml_pooled <- Filter(Negate(is.null), nebula_pod_results_list_reml_pooled)  # remove NULLs first
 
 end_time <- Sys.time()
-print(end_time - start_time)
+
 stopCluster(cl)
 
 nebula_nonconverged_percent <- (length(genes_list)-length(nebula_pod_results_list_reml_pooled))/length(genes_list)
-print(paste0(nebula_nonconverged_percent*100, "% filtered due to low expression"))
+
 temp_file <- tempfile(fileext = "rds") # need to create a temporary file
 saveRDS(nebula_pod_results_list_reml_pooled, temp_file) # save the temp file locally (will delete after R session)
 s3$upload_file(temp_file, "attempt", 'POD/nebula/pod_attempt_hvg_nebula_res_reml_pooled.rds')
@@ -4989,13 +4770,9 @@ s3$upload_file(temp_file, "attempt", 'POD/nebula/pod_attempt_hvg_nebula_res_reml
 ###### REML with rounded counts & pooled offset
 
 ```{r echo = F, eval = T}
+# run NEBULA on all POD genes
 counts_pod <- round(GetAssayData(attempt_so_pod, layer = "counts")) # load counts and round
 genes_list <- rownames(counts_pod)
-
-# meta_pod <- attempt_so_pod@meta.data
-# pred = model.matrix(~treatment*visit, data = meta_pod)
-# data_g_pod = group_cell(count=counts_pod, id=meta_pod$subject, pred=pred)
-# offset_pod = Matrix::colSums(data_g_pod$count) 
 
 cl <- makeCluster(100)
 registerDoParallel(cl)
@@ -5043,11 +4820,11 @@ nebula_pod_results_list_reml_pooled <- lapply(nebula_pod_results_list_reml_poole
 nebula_pod_results_list_reml_pooled <- Filter(Negate(is.null), nebula_pod_results_list_reml_pooled)  # remove NULLs first
 
 end_time <- Sys.time()
-print(end_time - start_time)
+
 stopCluster(cl)
 
 nebula_nonconverged_percent <- (length(genes_list)-length(nebula_pod_results_list_reml_pooled))/length(genes_list)
-print(paste0(nebula_nonconverged_percent*100, "% filtered due to low expression"))
+
 temp_file <- tempfile(fileext = "rds") # need to create a temporary file
 saveRDS(nebula_pod_results_list_reml_pooled, temp_file) # save the temp file locally (will delete after R session)
 s3$upload_file(temp_file, "attempt", 'POD/nebula/pod_attempt_nebula_res_reml_pooled.rds')
@@ -5057,19 +4834,12 @@ s3$upload_file(temp_file, "attempt", 'POD/nebula/pod_attempt_nebula_res_reml_poo
 # KPMP Cell types Nebula
 
 ```{r echo = F}
-source("/mmfs1/gscratch/togo/yejichoi/CHCO-Code/Petter Bjornstad/ATTEMPT/attempt_functions.R")
-# --- cell type groups
+# re-source functions (in case of updated definitions)
+source(here("attempt_functions.R"))
+# define cell type groups for grouped analysis
 celltype_groups <- list(
-  # PT = c("PT-S1/S2", "PT-S3", "aPT"),
   TAL = c("C-TAL-1", "C-TAL-2", "aTAL", "dTAL"),
-  PC = c("CCD-PC", "CNT-PC", "dCCD-PC", "M-PC", "tPC-IC"),
-  # EC = c("EC-AVR", "EC-GC", "EC-PTC", "EC-AEA", "EC-LYM", "EC/VSMC"),
-  # IC = c("IC-A", "IC-B", "aIC"),
-  # Immune = c("MAC", "MON", "cDC", "pDC", "CD4+ T", "CD8+ T", "B", "NK"),
-  # Immune_myeloid = c("MAC", "MON", "cDC", "pDC"),
-  # Immune_lymphoid = c("CD4+ T", "CD8+", "T", "B", "NK"),
-  # VSMC_P_FIB = c("VSMC/P", "FIB"),
-  # POD = "POD"
+  PC = c("CCD-PC", "CNT-PC", "dCCD-PC", "M-PC", "tPC-IC")
 )
 
 all_listed_celltypes <- unique(unlist(celltype_groups))
@@ -5079,20 +4849,6 @@ nebula_kpmp_results_list_reml_pooled <- list()
 
 # --- Helper function to run HVG + ALL analysis
 run_for_subset <- function(so_subset, label) {
-  # --- HVG selection for this subset
-  # so_hvg <- FindVariableFeatures(so_subset, selection.method = "vst", nfeatures = 2000)
-  # hvgs <- VariableFeatures(so_hvg)
-  # so_hvg <- subset(so_subset, features = hvgs)
-
-  # # --- HVG run
-  # res_hvg <- run_nebula_parallel(
-  #   seurat_obj = so_hvg,
-  #   n_cores = 100,
-  #   s3_bucket = "attempt",
-  #   s3_key = paste0(label, "/HVG/nebula/", gsub("/", "_", tolower(label)),
-  #                   "_kpmp_attempt_nebula_res_reml_pooled.rds")
-  # )
-
   # --- ALL run
   res_all <- run_nebula_parallel(
     seurat_obj = so_subset,
@@ -5102,9 +4858,7 @@ run_for_subset <- function(so_subset, label) {
                     "_kpmp_attempt_nebula_res_reml_pooled.rds")
   )
 
-  list(
-    # HVG = res_hvg, 
-       ALL = res_all)
+  list(ALL = res_all)
 }
 
 # --- Loop through each cell type group
@@ -5116,20 +4870,10 @@ for (grp_name in names(celltype_groups)) {
 
   nebula_kpmp_results_list_reml_pooled[[paste0(grp_name, "_group")]] <- res_list
 }
-
-# # --- Loop through each individual cell type
-# for (ct in all_listed_celltypes) {
-#   message("Processing individual cell type: ", ct)
-#   
-#   so_subset <- subset(attempt_so, idents = ct)
-#   res_list <- run_for_subset(so_subset, paste0("individual/", ct))
-#   
-#   nebula_kpmp_results_list_reml_pooled[[paste0(ct, "_individual")]] <- res_list
-# }
 ```
 
 ```{r echo = F}
-# --- cell type groups
+# run NEBULA on broad epithelial and endo/glom combined groups (HVG + all genes)
 celltype_groups <- list(
   EPI_combined = c("PT-S1/S2", "PT-S3", "aPT", "ATL", "DTL", "aDTL", "dTAL", "aTAL", "C-TAL-1", "C-TAL-2", "DCT", "dDCT", "CNT", "CNT-PC", "CCD-PC", "dCCD-PC", "M-PC", "IC-A", "IC-B", "aIC", "tPC-IC", "POD", "PEC", "MC"),
   ENDO_GLOM_VSMC_combined = c("EC-AVR", "EC-GC", "EC-PTC", "EC-AEA", "EC-LYM", "EC/VSMC", "POD", "MC", "VSMC/P")
@@ -5165,9 +4909,7 @@ run_for_subset <- function(so_subset, label) {
                     "_kpmp_attempt_nebula_res_reml_pooled.rds")
   )
 
-  list(
-    # HVG = res_hvg, 
-       ALL = res_all)
+  list(ALL = res_all)
 }
 
 # --- Loop through each cell type group
@@ -5193,6 +4935,7 @@ for (ct in all_listed_celltypes) {
 
 # Proteomics specific cell types
 ```{r echo = F}
+# define cell type groups matching urine and plasma proteomics compartments
 urine_celltype_groups <- list(
   PT = c("PT-S1/S2", "PT-S3", "aPT"),  # Proximal tubule
   TAL = c("C-TAL-1", "C-TAL-2", "aTAL", "dTAL"),  # Thick ascending limb
@@ -5233,25 +4976,11 @@ proteomics_celltypes <- c(urine_celltype_groups, plasma_celltype_groups)
 ```
 
 ```{r echo = F}
-# --- Initialize result list
+# run NEBULA on proteomics-specific cell type groupings
 nebula_kpmp_proteomics_specific <- list()
 
-# --- Helper function to run HVG + ALL analysis
+# --- Helper function to run ALL analysis
 run_for_subset <- function(so_subset, label) {
-  # # --- HVG selection for this subset
-  # so_hvg <- FindVariableFeatures(so_subset, selection.method = "vst", nfeatures = 2000)
-  # hvgs <- VariableFeatures(so_hvg)
-  # so_hvg <- subset(so_subset, features = hvgs)
-  # 
-  # # --- HVG run
-  # res_hvg <- run_nebula_parallel(
-  #   seurat_obj = so_hvg,
-  #   n_cores = 50,
-  #   s3_bucket = "attempt",
-  #   s3_key = paste0(label, "/HVG/nebula/", gsub("/", "_", tolower(label)),
-  #                   "_kpmp_attempt_nebula_res_reml_pooled.rds")
-  # )
-
   # --- ALL run
   res_all <- run_nebula_parallel(
     seurat_obj = so_subset,
@@ -5261,9 +4990,7 @@ run_for_subset <- function(so_subset, label) {
                     "_kpmp_attempt_nebula_res_reml_pooled.rds")
   )
 
-  list(
-    # HVG = res_hvg, 
-       ALL = res_all)
+  list(ALL = res_all)
 }
 
 # --- Loop through each cell type group
@@ -5283,6 +5010,7 @@ for (grp_name in "Combined_p") {
 # Expression
 
 ```{r echo = F}
+# download nonconverged gene lists from NEBULA for each cell type and model
 prefixes <- c("pt", "tal", "pc", "ic", "ec", "fibvsmcp", "immune")
 mods <- paste0("mod", 1:4)
 
@@ -5298,6 +5026,7 @@ nonconverged_genes <- setNames(lapply(prefixes, function(prefix) {
 
 ### PT
 ```{r echo = F}
+# quantify expression of nonconverged genes in PT cells and plot by model
 percent.nonconverged.mod1 <- PercentageFeatureSet(attempt_so_hvg_pt, features = nonconverged_genes$pt[["mod1"]])
 percent.nonconverged.mod2 <- PercentageFeatureSet(attempt_so_hvg_pt, features = nonconverged_genes$pt[["mod2"]])
 percent.nonconverged.mod3 <- PercentageFeatureSet(attempt_so_hvg_pt, features = nonconverged_genes$pt[["mod3"]])
@@ -5355,6 +5084,7 @@ s3$upload_file(temp_file, "attempt", "Figures/nonconverged/pt_nonconverged_expre
 
 ### TAL
 ```{r echo = F}
+# quantify expression of nonconverged genes in TAL cells and plot by model
 percent.nonconverged.mod1 <- PercentageFeatureSet(attempt_so_hvg_tal, features = nonconverged_genes$tal[["mod1"]])
 percent.nonconverged.mod2 <- PercentageFeatureSet(attempt_so_hvg_tal, features = nonconverged_genes$tal[["mod2"]])
 percent.nonconverged.mod3 <- PercentageFeatureSet(attempt_so_hvg_tal, features = nonconverged_genes$tal[["mod3"]])
@@ -5411,6 +5141,7 @@ s3$upload_file(temp_file, "attempt", "Figures/nonconverged/tal_nonconverged_expr
 ```
 ### immune
 ```{r echo = F}
+# quantify expression of nonconverged genes in immune cells and plot by model
 percent.nonconverged.mod1 <- PercentageFeatureSet(attempt_so_hvg_immune, features = nonconverged_genes$immune[["mod1"]])
 percent.nonconverged.mod2 <- PercentageFeatureSet(attempt_so_hvg_immune, features = nonconverged_genes$immune[["mod2"]])
 percent.nonconverged.mod3 <- PercentageFeatureSet(attempt_so_hvg_immune, features = nonconverged_genes$immune[["mod3"]])
@@ -5467,6 +5198,7 @@ s3$upload_file(temp_file, "attempt", "Figures/nonconverged/immune_nonconverged_e
 ```
 ### PC
 ```{r echo = F}
+# quantify expression of nonconverged genes in PC cells and plot by model
 attempt_so_hvg_pc[["percent.nonconverged.mod1"]] <- PercentageFeatureSet(attempt_so_hvg_pc, features = nonconverged_genes$pc[[1]])
 
 percent.nonconverged.mod1 <- PercentageFeatureSet(attempt_so_hvg_pc, features = nonconverged_genes$pc[["mod1"]])
@@ -5526,6 +5258,7 @@ s3$upload_file(temp_file, "attempt", "Figures/nonconverged/pc_nonconverged_expre
 
 ### IC
 ```{r echo = F}
+# quantify expression of nonconverged genes in IC cells and plot by model
 attempt_so_hvg_ic[["percent.nonconverged.mod1"]] <- PercentageFeatureSet(attempt_so_hvg_ic, features = nonconverged_genes$ic[[1]])
 
 percent.nonconverged.mod1 <- PercentageFeatureSet(attempt_so_hvg_ic, features = nonconverged_genes$ic[["mod1"]])
@@ -5584,6 +5317,7 @@ s3$upload_file(temp_file, "attempt", "Figures/nonconverged/ic_nonconverged_expre
 ```
 ### EC
 ```{r echo = F}
+# quantify expression of nonconverged genes in EC cells and plot by model
 attempt_so_hvg_ec[["percent.nonconverged.mod1"]] <- PercentageFeatureSet(attempt_so_hvg_ec, features = nonconverged_genes$ec[[1]])
 
 percent.nonconverged.mod1 <- PercentageFeatureSet(attempt_so_hvg_ec, features = nonconverged_genes$ec[["mod1"]])
@@ -5642,6 +5376,7 @@ s3$upload_file(temp_file, "attempt", "Figures/nonconverged/ec_nonconverged_expre
 ```
 ### FIB, VSMC/P
 ```{r echo = F}
+# quantify expression of nonconverged genes in FIB/VSMC cells and plot by model
 attempt_so_hvg_fibvsmc[["percent.nonconverged.mod1"]] <- PercentageFeatureSet(attempt_so_hvg_fibvsmc, features = nonconverged_genes$fibvsmcp[[1]])
 
 percent.nonconverged.mod1 <- PercentageFeatureSet(attempt_so_hvg_fibvsmc, features = nonconverged_genes$fibvsmcp[["mod1"]])
@@ -5701,12 +5436,13 @@ s3$upload_file(temp_file, "attempt", "Figures/nonconverged/fibvsmcp_nonconverged
 
 # HVGs (union)
 ```{r echo = F}
+# combine HVGs from all cell types into a single union set
 hvgs_union <- unique(c(hvgs_ec, hvgs_fibvsmc, hvgs_ic, hvgs_immune, hvgs_pc, hvgs_pt, hvgs_tal))
-length(hvgs_union)
 ```
 
 # Dot plot of markers
 ```{r echo = F}
+# check HAVCR1 (KIM-1) differential expression in placebo vs dapa
 FindMarkers(subset(attempt_so_raw, treatment == "Placebo"), group.by = "visit",
             ident.1 = "POST", ident.2 = "PRE", features = "HAVCR1", min.pct = 0, logfc.threshold = 0)
 
@@ -5715,6 +5451,7 @@ FindMarkers(subset(attempt_so_raw, treatment == "Dapagliflozin 5mg"), group.by =
 
 attempt_so$treatment_visit <- paste0(attempt_so$treatment, "_", attempt_so$visit)
 
+# dot plots of kidney injury markers across PT subtypes by treatment x visit
 markers <- c("CD24", "PROM1", "VCAM1", "CST3")
 
 DotPlot(object = subset(attempt_so, KPMP_celltype %in% c("PT-S1/S2", "PT-S3", "aPT")),

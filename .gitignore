@@ -1,0 +1,44 @@
+# Credentials and keys
+keys.json
+*.pem
+*.key
+.env
+.Renviron
+
+# Data files (too large for version control)
+*.rds
+*.RDS
+*.rda
+*.RData
+*.h5
+*.h5ad
+*.h5seurat
+*.loom
+
+# Results and output files
+*.xlsx
+*.csv
+*.tsv
+*.pdf
+*.png
+*.jpg
+*.jpeg
+*.tiff
+*.svg
+
+# R session files
+.Rhistory
+.RData
+.Rproj.user/
+
+# Quarto render output
+*_files/
+*_cache/
+*.html
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# AWS/S3 configuration
+.aws/

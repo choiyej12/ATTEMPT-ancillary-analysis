@@ -14,6 +14,7 @@ format:
 ---
 
 ```{r echo = F, include = F}
+# load required packages
 library(jsonlite)
 library(aws.s3)
 library(dplyr)
@@ -33,37 +34,30 @@ library(openxlsx)
 library(SomaPlotr)
 library(lme4)
 library(lmerTest)
+library(here)
 
-# specify user for paths
-user <- Sys.info()[["user"]]
+# source shared ATTEMPT analysis functions (from this repository)
+source(here("attempt_functions.R"))
 
-if (user == "choiyej") {
-  root_path <- "/Users/choiyej/Library/CloudStorage/OneDrive-SharedLibraries-UW/Laura Pyle - Bjornstad/Biostatistics Core Shared Drive/"
-  git_path <- "/Users/choiyej/GitHub/CHCO-Code/Petter Bjornstad/"
-} else if (user == "pylell") {
-  root_path <- "/Users/pylell/Library/CloudStorage/OneDrive-SharedLibraries-UW/Bjornstad/Biostatistics Core Shared Drive/"
-  git_path <- "/Users/pylell/Documents/GitHub/CHCO-Code/Petter Bjornstad/"
-} else {
-  stop("Unknown user: please specify root path for this user.")
-}
+# NOTE: correlation_function.R is available in the main CHCO-Code repository
+# source("correlation_function.R")
 
-source(file.path(git_path, "ATTEMPT/attempt_functions.R"))
-source(file.path(git_path, "Resources/YC/R Functions/correlation_function.R"))
-
-bg_path <- file.path(root_path, "GSEA/")
+# set paths for data inputs and results outputs
+bg_path <- file.path(root_path, "GSEA")
 load(file.path(root_path, "KNIGHT/Somalogic data/analytes.Rdata"))
 
-# load urine creatinine
+# load urine creatinine sample manifest
 urine_creat <- read.xlsx(file.path(root_path, 'ATTEMPT/Data Raw/Urine Proteomics Sample Manifest Jun 25 2025.xlsx'), sheet = "Working")
 names(urine_creat) <- c("position", "record_id", "visit", "box", "creatinine_u_proteomics", "comments")
-# SOMA analytes names/info
+# load SomaScan analyte annotation metadata
 load(file.path(root_path, "Data Harmonization/Combined SomaScan/analytes_2.Rdata"))
 
 ```
 
 ```{r include = F}
-## Create an S3 client
-keys <- fromJSON("/Users/choiyej/Library/CloudStorage/OneDrive-TheUniversityofColoradoDenver/Bjornstad Pyle Lab/keys.json")
+# configure S3 connection to Kopah (UW research storage)
+# NOTE: users must provide their own keys.json with AWS credentials
+keys <- fromJSON(Sys.getenv("ATTEMPT_KEYS_PATH", unset = "keys.json"))
 
 Sys.setenv(
   "AWS_ACCESS_KEY_ID" = keys$MY_ACCESS_KEY,
@@ -76,8 +70,10 @@ Sys.setenv(
 
 
 ```{r echo = F}
-harm_dat_raw <- read.csv(file.path(root_path, "Data Harmonization/Data Clean/soma_harmonized_dataset.csv"), na.strings = "") 
+# load harmonized SomaScan dataset and filter to ATTEMPT study
+harm_dat_raw <- read.csv(file.path(root_path, "Data Harmonization/Data Clean/soma_harmonized_dataset.csv"), na.strings = "")
 
+# collapse duplicate record_id/visit rows and add race/ethnicity categories
 attempt_redcap <- harm_dat_raw %>% filter(study == "ATTEMPT") %>%
   dplyr::summarise(across(where(negate(is.numeric)), ~ ifelse(all(is.na(.x)), NA_character_, last(na.omit(.x)))),
                    across(where(is.numeric), ~ ifelse(all(is.na(.x)), NA_real_, mean(.x, na.rm = TRUE))),
@@ -91,6 +87,7 @@ attempt_redcap <- harm_dat_raw %>% filter(study == "ATTEMPT") %>%
   arrange(record_id) %>%
   dplyr::select(-hba1c, -starts_with("seq."))
 
+# subset Denver site participants and recode visits to numeric weeks
 attempt_redcap_denver <- attempt_redcap %>%
   filter(grepl("^3", record_id)) %>%
   mutate(visit = case_when(visit == "baseline" ~ 0,
@@ -136,7 +133,7 @@ attempt_biopsy_yn <- attempt_biopsy_yn %>%
           filter(visit == 0) %>%
           mutate(visit = -4))
 
-# merge REDCap version (for Denver) and dataset from Antoine
+# merge REDCap version (for Denver) and dataset from Antoine, flag biopsy status
 attempt_dat <- left_join(attempt_dat, attempt_redcap_denver) %>%
   left_join(attempt_biopsy_yn) %>%
   mutate(biopsy_yn = case_when(biopsy_yn == "Yes" ~ "Yes",
@@ -145,6 +142,7 @@ attempt_dat$treatment <- factor(attempt_dat$treatment, levels = c("Placebo", "Da
 ```
 
 ```{r echo = F}
+# prepare harmonized data for proteomics: collapse rows, recode visits, keep baseline and 4-month
 harm_dat <- harm_dat_raw %>%
   filter(study == "ATTEMPT") %>%
   dplyr::summarise(across(where(negate(is.numeric)), ~ ifelse(all(is.na(.x)), NA_character_, last(na.omit(.x)))),
@@ -160,10 +158,10 @@ harm_dat <- harm_dat_raw %>%
                                    T ~ "Dapagliflozin")) %>%
   filter(visit %in% c(0, 16))
 
-# load SOMA and exclude the 5 with mix up
+# filter to samples with SomaScan data and exclude serum mix-ups (low urine creatinine)
 soma <- harm_dat %>%
   filter(!is.na(seq.10030.8)) %>%
-  filter(urine_creat_proteomics > 1) # filtering out those with extremely low creatinine (mix up with serum)
+  filter(urine_creat_proteomics > 1)
 
 soma$visit <- factor(soma$visit, levels = c(0, 16), label = c("PRE", "POST"))
 ```
@@ -171,7 +169,8 @@ soma$visit <- factor(soma$visit, levels = c(0, 16), label = c("PRE", "POST"))
 # SOMA
 
 ```{r echo = F, results='asis'}
-summary(arsenal::tableby(visit ~ age + sex + bmi + diabetes_duration, 
+# descriptive table of demographics by visit and treatment arm
+summary(arsenal::tableby(visit ~ age + sex + bmi + diabetes_duration,
                          data = soma, strata = treatment_arm), test = F, 
         labelTranslations = c("age" = "Age", "sex" = "Sex", "acr_u" = "UACR", 
                               "bmi" = "BMI", "diabetes_duration" = "Diabetes duration"))
@@ -179,6 +178,7 @@ summary(arsenal::tableby(visit ~ age + sex + bmi + diabetes_duration,
 
 ## Placebo
 ```{r echo = F}
+# fit limma within-treatment model for placebo group (PRE vs POST)
 placebo_res_plasma <- run_limma_proteomics(data = soma,
                                            analyte_info = analytes_attempt,
                                            treatment = "Placebo",
@@ -187,10 +187,11 @@ placebo_res_plasma <- run_limma_proteomics(data = soma,
 ```
 
 ```{r echo = F}
+# volcano plots for placebo group (raw and adjusted p-values)
 plot_volcano_proteomics(data = placebo_res_plasma$results_annotated, fc = "logFC",
                         p_col = "P.Value",
                         title = NULL,
-                        x_axis = "LogFC", 
+                        x_axis = "LogFC",
                         y_axis = "-log10(p-value)",
                         positive_text = "Positive after placebo treatment",
                         negative_text = "Negative after placebo treatment",
@@ -209,6 +210,7 @@ plot_volcano_proteomics(data = placebo_res_plasma$results_annotated, fc = "logFC
 
 ## Dapagliflozin
 ```{r echo = F}
+# fit limma within-treatment model for dapagliflozin group (PRE vs POST)
 dapa_res_plasma <- run_limma_proteomics(data = soma,
                                         analyte_info = analytes_attempt,
                                         treatment = "Dapagliflozin",
@@ -217,10 +219,11 @@ dapa_res_plasma <- run_limma_proteomics(data = soma,
 ```
 
 ```{r echo = F}
+# volcano plots for dapagliflozin group (raw and adjusted p-values)
 plot_volcano_proteomics(data = dapa_res_plasma$results_annotated, fc = "logFC",
                         p_col = "P.Value",
                         title = NULL,
-                        x_axis = "LogFC", 
+                        x_axis = "LogFC",
                         y_axis = "-log10(p-value)",
                         positive_text = "Positive after dapagliflozin treatment",
                         negative_text = "Negative after dapagliflozin treatment",
@@ -239,6 +242,7 @@ plot_volcano_proteomics(data = dapa_res_plasma$results_annotated, fc = "logFC",
 
 ## PRE (Placebo vs. Dapa)
 ```{r echo = F}
+# fit limma cross-sectional model comparing treatment arms at baseline
 pre_res_plasma <- run_limma_proteomics(data = soma,
                                        analyte_info = analytes_attempt,
                                        visit = "PRE",
@@ -247,10 +251,11 @@ pre_res_plasma <- run_limma_proteomics(data = soma,
 ```
 
 ```{r echo = F}
+# volcano plots for baseline treatment comparison (raw and adjusted p-values)
 plot_volcano_proteomics(data = pre_res_plasma$results_annotated, fc = "logFC",
                         p_col = "P.Value",
                         title = NULL,
-                        x_axis = "LogFC", 
+                        x_axis = "LogFC",
                         y_axis = "-log10(p-value)",
                         positive_text = "Positive in dapagliflozin\ncompared to placebo (at baseline)",
                         negative_text = "Negative in dapagliflozin\ncompared to placebo (at baseline)",
@@ -269,6 +274,7 @@ plot_volcano_proteomics(data = pre_res_plasma$results_annotated, fc = "logFC",
 
 ## POST (Placebo vs. Dapa)
 ```{r echo = F}
+# fit limma cross-sectional model comparing treatment arms at follow-up
 post_res_plasma <- run_limma_proteomics(data = soma,
                                         analyte_info = analytes_attempt,
                                         visit = "POST",
@@ -277,10 +283,11 @@ post_res_plasma <- run_limma_proteomics(data = soma,
 ```
 
 ```{r echo = F}
+# volcano plots for follow-up treatment comparison (raw and adjusted p-values)
 plot_volcano_proteomics(data = post_res_plasma$results_annotated, fc = "logFC",
                         p_col = "P.Value",
                         title = NULL,
-                        x_axis = "LogFC", 
+                        x_axis = "LogFC",
                         y_axis = "-log10(p-value)",
                         positive_text = "Positive in dapagliflozin\ncompared to placebo (at follow-up)",
                         negative_text = "Negative in dapagliflozin\ncompared to placebo (at follow-up)",
@@ -299,34 +306,36 @@ plot_volcano_proteomics(data = post_res_plasma$results_annotated, fc = "logFC",
 
 # DiD
 ```{r echo = F}
-# using creatinine adjusted proteins
+# fit limma DiD interaction model (fixed effects) for plasma proteomics
 did_res_plasma <- run_limma_proteomics(data = soma,
                                        analyte_info = analytes_attempt,
                                        feature_suffix = "",
                                        model_type = "interaction")
 
+# fit limma DiD mixed model with random intercept per subject
 did_res_plasma_mixed <- run_limma_proteomics(data = soma,
                                              analyte_info = analytes_attempt,
                                              feature_suffix = "",
                                              model_type = "interaction_random")
-# 6 out of 7289 singularity warning (0.1%)
+# save mixed model DiD results to S3 and local CSV
 s3saveRDS(did_res_plasma_mixed, "Proteomics/plasma_proteomics_res.RDS", "attempt", region = "")
-write.csv(did_res_plasma_mixed$results_annotated, file.path(root_path, "ATTEMPT/Results/Somascan/plasma_proteomics_res.csv"), row.names = F)
+write.csv(did_res_plasma_mixed$results_annotated, file.path(results_dir, "Somascan/plasma_proteomics_res.csv"), row.names = F)
 ```
 
 ```{r echo = F}
-plot_volcano_proteomics(data = did_res_plasma$results_annotated, 
+# volcano plots for DiD fixed-effects model (raw and adjusted p-values)
+plot_volcano_proteomics(data = did_res_plasma$results_annotated,
                         fc = "logFC",
                         p_col = "P.Value",
                         title = NULL,
-                        x_axis = "LogFC", 
+                        x_axis = "LogFC",
                         y_axis = "-log10(p-value)",
                         positive_text = "Positive DiD",
                         negative_text = "Negative DiD",
                         formula = "treatment:visit",
                         file_suffix = "_DiD_plasma_proteomics")
 
-plot_volcano_proteomics(data = did_res_plasma$results_annotated, 
+plot_volcano_proteomics(data = did_res_plasma$results_annotated,
                         fc = "logFC",
                         p_col = "adj.P.Val",
                         title = NULL,
@@ -337,18 +346,19 @@ plot_volcano_proteomics(data = did_res_plasma$results_annotated,
                         formula = "treatment:visit",
                         file_suffix = "_DiD_plasma_proteomics_adjp")
 
-plot_volcano_proteomics(data = did_res_plasma_mixed$results_annotated, 
+# volcano plots for DiD mixed model (raw and adjusted p-values)
+plot_volcano_proteomics(data = did_res_plasma_mixed$results_annotated,
                         fc = "logFC",
                         p_col = "P.Value",
                         title = NULL,
-                        x_axis = "LogFC", 
+                        x_axis = "LogFC",
                         y_axis = "-log10(p-value)",
                         positive_text = "Positive DiD",
                         negative_text = "Negative DiD",
                         formula = "treatment:visit + (1|subject)",
                         file_suffix = "_DiD_plasma_proteomics_mixed")
 
-plasma_volcano <- plot_volcano_proteomics(data = did_res_plasma_mixed$results_annotated, 
+plasma_volcano <- plot_volcano_proteomics(data = did_res_plasma_mixed$results_annotated,
                         fc = "logFC",
                         p_col = "adj.P.Val",
                         title = NULL,
@@ -361,7 +371,7 @@ plasma_volcano <- plot_volcano_proteomics(data = did_res_plasma_mixed$results_an
 ```
 
 ```{r echo = F}
-# DiD heatmap
+# pivot DiD mixed model results to wide format and filter to nominal sig for heatmap
 res_full_wide <- did_res_plasma_mixed$results_full %>%
   dplyr::select(-effect) %>%
   # Pivot wider, creating columns for each term's statistics
@@ -375,6 +385,7 @@ res_full_wide <- did_res_plasma_mixed$results_full %>%
          Gene_seq = paste0(EntrezGeneSymbol, " (", SeqId, ")")) %>%
   filter(`treatment_armDapagliflozin:visitPOST_P.Value` < 0.05)
 
+# create heatmap of top 20 DiD proteins and combine with volcano into panel figure
 plasma_heatmap <- plot_treatment_heatmap(data = res_full_wide,
                        p_col = "P.Value",
                        top_n = 20,
@@ -385,11 +396,12 @@ plasma_heatmap <- plot_treatment_heatmap(data = res_full_wide,
                        heatmap_caption = F)
 
 ggarrange(plasma_volcano, plasma_heatmap, widths = c(2,1), labels = "AUTO")
-ggsave(file.path(root_path, "ATTEMPT/Results/Figures/Panels/plasma_proteomics_panel.png"), width = 10, height = 6)
+ggsave(file.path(results_dir, "Figures/Panels/plasma_proteomics_panel.png"), width = 10, height = 6)
 ```
 ## GSEA (fgsea)
 
 ```{r echo = F}
+# run fgsea pathway enrichment on DiD mixed model results
 soma_DiD_fgsea <- run_fgsea_analysis(bg_path = bg_path,
                                      results_annotated = did_res_plasma_mixed$results_annotated,
                                      stat_col = "statistic")
@@ -397,37 +409,36 @@ soma_DiD_fgsea$summary
 ```
 
 ```{r echo = F}
-# KEGG
-plot_fgsea_transpose(soma_DiD_fgsea$kegg, 
+# plot top 30 enriched pathways for each gene set (KEGG, REACTOME, GO)
+plot_fgsea_transpose(soma_DiD_fgsea$kegg,
                      title = "SOMA DiD Top 30 KEGG",
                      xmax = 30)
-ggsave(file.path(root_path, "ATTEMPT/Results/Figures/Proteomics/Pathways/plasma_SOMA_DiD_KEGG.png"),
+ggsave(file.path(results_dir, "Figures/Proteomics/Pathways/plasma_SOMA_DiD_KEGG.png"),
        width = 27.5, height = 14, scale = 1)
 # REACTOME
 plot_fgsea_transpose(soma_DiD_fgsea$reactome, 
                      title = "SOMA DiD Top 30 REACTOME", 
                      xmax = 30)
-ggsave(file.path(root_path, "ATTEMPT/Results/Figures/Proteomics/Pathways/plasma_SOMA_DiD_REACTOME.png"),
+ggsave(file.path(results_dir, "Figures/Proteomics/Pathways/plasma_SOMA_DiD_REACTOME.png"),
        width = 27.5, height = 14, scale = 1)
 # GO
 plot_fgsea_transpose(soma_DiD_fgsea$go, 
                      title = "SOMA DiD Top 30 GO", 
                      xmax = 30)
-ggsave(file.path(root_path, "ATTEMPT/Results/Figures/Proteomics/Pathways/plasma_SOMA_DiD_GO.png"),
+ggsave(file.path(results_dir, "Figures/Proteomics/Pathways/plasma_SOMA_DiD_GO.png"),
        width = 27.5, height = 14, scale = 1)
 ```
 
 ## Integrate transcriptomics
 
 ```{r echo = F}
-# read in results from transcriptomics (EC, POD, MES, VSMC, Immune) for plasma proteimics)
+# read in nebula scRNA-seq DiD results for each cell type from S3
 celltypes <- c("EC", "POD", "FIB/VSMC/P", "Immune")
 
-# Full gene set (not limited to 2000 HVG)
+# load full gene set results (not limited to 2000 HVG)
 for (cell in celltypes)  {
   input_path <- paste0(cell,"/nebula/",tolower(cell),"_attempt_nebula_res_reml_pooled.rds")
   cell_df <- s3readRDS(input_path, bucket = "attempt", region = "")
-  head(cell_df)
   processed <- process_nebula_results(cell_df)
   lower_cell <- tolower(cell)
   var_name <- paste0(lower_cell, "_nebula_res_combined_reml_pooled")
@@ -435,9 +446,11 @@ for (cell in celltypes)  {
   assign(var_name, processed$results)
 }
 
+# filter to nominally significant DiD proteins
 plasma_did_sig <- did_res_plasma_mixed$results_annotated %>%
   filter(P.Value < 0.05)
 
+# compute PRE-to-POST deltas for creatinine-adjusted proteins
 plasma_delta <- soma %>%
   select(record_id, visit, treatment_arm, starts_with(pt_map$AptName) & ends_with("cradj")) %>%
   pivot_wider(
@@ -454,22 +467,20 @@ s3saveRDS(plasma_delta, "Proteomics/plasma_cradj_proteomics_delta.RDS", "attempt
 ```
 
 ```{r echo = F}
-# create mapping table for each celltype
-
+# map overlapping sig genes between scRNA DiD and plasma proteomics DiD per cell type
 walk(celltypes, function(ct) {
-  
-  # Dynamically get the nebula results object based on cell type
+
   nebula_obj <- get(paste0(tolower(ct), "_nebula_res_combined_reml_pooled"))
-  
+
   sig <- nebula_obj %>%
     filter(`p_treatmentDapagliflozin:visitPOST` < 0.05)
-  
+
   map <- analytes_info %>%
     filter(EntrezGeneSymbol %in% unique(sig$Gene[sig$Gene %in% plasma_did_sig$EntrezGeneSymbol])) %>%
     select(Target, TargetFullName, AptName, EntrezGeneSymbol)
-  
-  write.csv(map, 
-            file.path(root_path, paste0("ATTEMPT/Results/Somascan/", ct, "_plasma_proteomics_map.csv")), 
+
+  write.csv(map,
+            file.path(results_dir, "Somascan", paste0(ct, "_plasma_proteomics_map.csv")),
             row.names = FALSE, na = "")
 })
 ```
@@ -479,7 +490,7 @@ walk(celltypes, function(ct) {
 ### mGFR
 
 ```{r echo = F, warning=FALSE, quiet = TRUE}
-# mGFR 
+# correlate plasma protein deltas with change in mGFR
 plasma_soma_mgfr <- soma_corr(
   clinical_raw = attempt_dat,
   soma_raw     = soma,
@@ -496,13 +507,14 @@ plasma_soma_mgfr$correlation_table
 
 # plots
 plasma_soma_mgfr$plot_all
-ggsave(file.path(root_path, "ATTEMPT/Results/Figures/Proteomics/Volcano Plots/Correlations/volcano_mixed_spearman_plasma_mgfr.png"),
+ggsave(file.path(results_dir, "Figures/Proteomics/Volcano Plots/Correlations/volcano_mixed_spearman_plasma_mgfr.png"),
        plasma_soma_mgfr$plot_all, width = 10, height = 7)
 ```
 
 ### mGFR adjusted
 
 ```{r echo = F, warning=FALSE}
+# correlate plasma protein deltas with change in BSA-adjusted mGFR
 plasma_soma_mgfr_adj <- soma_corr(
   clinical_raw = attempt_dat,
   soma_raw     = soma,
@@ -519,13 +531,14 @@ plasma_soma_mgfr_adj$correlation_table
 
 # plots
 plasma_soma_mgfr_adj$plot_all
-ggsave(file.path(root_path, "ATTEMPT/Results/Figures/Proteomics/Volcano Plots/Correlations/volcano_mixed_spearman_plasma_mgfr_bsa.png"),
+ggsave(file.path(results_dir, "Figures/Proteomics/Volcano Plots/Correlations/volcano_mixed_spearman_plasma_mgfr_bsa.png"),
        plasma_soma_mgfr_adj$plot_all, width = 10, height = 7)
 ```
 
 ### HbA1c
 
 ```{r echo = F, warning=FALSE}
+# correlate plasma protein deltas with change in HbA1c
 plasma_soma_hba1c <- soma_corr(
   clinical_raw = attempt_dat,
   soma_raw     = soma,
@@ -541,13 +554,14 @@ plasma_soma_hba1c$correlation_table
 
 # plots
 plasma_soma_hba1c$plot_all
-ggsave(file.path(root_path, "ATTEMPT/Results/Figures/Proteomics/Volcano Plots/Correlations/volcano_mixed_spearman_plasma_hba1c.png"),
+ggsave(file.path(results_dir, "Figures/Proteomics/Volcano Plots/Correlations/volcano_mixed_spearman_plasma_hba1c.png"),
        plasma_soma_hba1c$plot_all, width = 10, height = 7)
 ```
 
 ### TIR
 
 ```{r echo = F, warning=FALSE}
+# correlate plasma protein deltas with change in CGM time-in-range
 plasma_soma_tir <- soma_corr(
   clinical_raw = attempt_dat,
   soma_raw     = soma,
@@ -563,13 +577,14 @@ plasma_soma_tir$correlation_table
 
 # plots
 plasma_soma_tir$plot_all
-ggsave(file.path(root_path, "ATTEMPT/Results/Figures/Proteomics/Volcano Plots/Correlations/volcano_mixed_spearman_plasma_tir.png"),
+ggsave(file.path(results_dir, "Figures/Proteomics/Volcano Plots/Correlations/volcano_mixed_spearman_plasma_tir.png"),
        plasma_soma_tir$plot_all, width = 10, height = 7)
 ```
 
 ### Weight
 
 ```{r echo = F, warning=FALSE}
+# correlate plasma protein deltas with change in weight
 plasma_soma_weight <- soma_corr(
   clinical_raw = attempt_dat,
   soma_raw     = soma,
@@ -585,13 +600,14 @@ plasma_soma_weight$correlation_table
 
 # plots
 plasma_soma_weight$plot_all
-ggsave(file.path(root_path, "ATTEMPT/Results/Figures/Proteomics/Volcano Plots/Correlations/volcano_mixed_spearman_plasma_weight.png"),
+ggsave(file.path(results_dir, "Figures/Proteomics/Volcano Plots/Correlations/volcano_mixed_spearman_plasma_weight.png"),
        plasma_soma_weight$plot_all, width = 10, height = 7)
 ```
 
 ### PWV
 
 ```{r echo = F, warning=FALSE}
+# correlate plasma protein deltas with change in pulse wave velocity
 plasma_soma_PWV <- soma_corr(
   clinical_raw = attempt_dat,
   soma_raw     = soma,
@@ -608,13 +624,14 @@ plasma_soma_PWV$correlation_table
 
 # plots
 plasma_soma_PWV$plot_all
-ggsave(file.path(root_path, "ATTEMPT/Results/Figures/Proteomics/Volcano Plots/Correlations/volcano_mixed_spearman_plasma_PWV.png"),
+ggsave(file.path(results_dir, "Figures/Proteomics/Volcano Plots/Correlations/volcano_mixed_spearman_plasma_PWV.png"),
        plasma_soma_PWV$plot_all, width = 10, height = 7)
 ```
 
 ### Cortical R2*
 
 ```{r echo = F, warning=FALSE}
+# correlate plasma protein deltas with change in cortical R2* (renal oxygenation)
 plasma_soma_avg_c_r2 <- soma_corr(
   clinical_raw = attempt_dat,
   soma_raw     = soma,
@@ -631,13 +648,14 @@ plasma_soma_avg_c_r2$correlation_table
 
 # plots
 plasma_soma_avg_c_r2$plot_all
-ggsave(file.path(root_path, "ATTEMPT/Results/Figures/Proteomics/Volcano Plots/Correlations/volcano_mixed_spearman_plasma_avg_c_r2.png"),
+ggsave(file.path(results_dir, "Figures/Proteomics/Volcano Plots/Correlations/volcano_mixed_spearman_plasma_avg_c_r2.png"),
        plasma_soma_avg_c_r2$plot_all, width = 10, height = 7)
 ```
 
 ### Kidney R2*
 
 ```{r echo = F, warning=FALSE}
+# correlate plasma protein deltas with change in kidney R2* (renal oxygenation)
 plasma_soma_avg_k_r2 <- soma_corr(
   clinical_raw = attempt_dat,
   soma_raw     = soma,
@@ -654,28 +672,14 @@ plasma_soma_avg_k_r2$correlation_table
 
 # plots
 plasma_soma_avg_k_r2$plot_all
-ggsave(file.path(root_path, "ATTEMPT/Results/Figures/Proteomics/Volcano Plots/Correlations/volcano_mixed_spearman_plasma_avg_k_r2.png"),
+ggsave(file.path(results_dir, "Figures/Proteomics/Volcano Plots/Correlations/volcano_mixed_spearman_plasma_avg_k_r2.png"),
        plasma_soma_avg_k_r2$plot_all, width = 10, height = 7)
-```
-
-```{r echo = F}
-# # write correlation results to file
-# wb <- createWorkbook()
-# addWorksheet(wb,"Change in mgfr_si")
-# writeData(wb,"Change in mgfr_si",corr_delta_mgfr_si_mat,rowNames = F)
-# addWorksheet(wb,"Change in mgfr_si_adjusted")
-# writeData(wb,"Change in mgfr_si_adjusted",corr_delta_mgfr_si_adjusted_mat,rowNames = F)
-# addWorksheet(wb,"Change in HbA1c")
-# writeData(wb,"Change in HbA1c",corr_delta_hba1c_percent_mat,rowNames = F)
-# addWorksheet(wb,"Change in PWV")
-# writeData(wb,"Change in PWV",corr_delta_PWV_mat,rowNames = F)
-# 
-# saveWorkbook(wb,file.path(root_path, "ATTEMPT/Results/Somascan/Somascan_clinical_correlations.xlsx"),overwrite = TRUE)
 ```
 
 # Integration with scRNA (results from Hyak)
 
 ```{r include = F}
+# define cell type groupings for scRNA-seq integration
 celltype_groups <- list(
   PT = c("PT-S1/S2", "PT-S3", "aPT"),
   TAL = c("C-TAL-1", "C-TAL-2", "aTAL", "dTAL"),
@@ -701,53 +705,23 @@ celltype_groups$Combined_p <- c(
   celltype_groups$Immune
 )
 
-## read mixed model results dataframe (rendered in Hyak)
-# process and read all results from ATTEMPT
-# Top 2000 HVG
+# read KPMP-reference nebula results per cell type group from local CSV
 for (cell in names(celltype_groups))  {
-  print(paste0("Processing: ", cell))
   cell <- gsub("/", "_", cell)
 
-  # annotated_df <- read.csv(file.path(root_path, "ATTEMPT/Results/nebula", paste0(tolower(cell), "_kpmp_hvg_res.csv")))
-  # colnames(annotated_df) <- gsub("\\.", ":", colnames(annotated_df))
-  # cell <- gsub("-", "_", cell)
-  # cell <- gsub("\\+\\s", "_", cell)
-  # lower_cell <- tolower(cell)
-  # var_name <- paste0(lower_cell, "_hvg_kpmp")
-  # print(var_name)
-  # assign(var_name, annotated_df)
-  
-    
-  annotated_df <- read.csv(file.path(root_path, "ATTEMPT/Results/nebula", paste0(tolower(cell), "_kpmp_res.csv")))
+  annotated_df <- read.csv(file.path(results_dir, "nebula", paste0(tolower(cell), "_kpmp_res.csv")))
   colnames(annotated_df) <- gsub("\\.", ":", colnames(annotated_df))
   cell <- gsub("-", "_", cell)
   cell <- gsub("\\+\\s", "_", cell)
   lower_cell <- tolower(cell)
   var_name <- paste0(lower_cell, "_kpmp")
-  print(var_name)
   assign(var_name, annotated_df)
 }
-# 
-# for (cell in unlist(celltype_groups))  {
-#   print(paste0("Processing: ", cell))
-#   cell <- gsub("/", "_", cell)
-#   cell <- gsub("-", "_", cell)
-#   cell <- gsub("\\+\\s", "_", cell)
-#   
-#   annotated_df <- read.csv(file.path(root_path, "ATTEMPT/Results/nebula", paste0(tolower(cell), "_kpmp_hvg_res.csv")))
-#   colnames(annotated_df) <- gsub("\\.", ":", colnames(annotated_df))
-#   cell <- gsub("-", "_", cell)
-#   cell <- gsub("\\+\\s", "_", cell)
-#   lower_cell <- tolower(cell)
-#   var_name <- paste0(lower_cell, "_hvg_kpmp")
-#   print(var_name)
-#   assign(var_name, annotated_df)
-# 
-# }
 ```
 
 
 ```{r echo = F}
+# load VSMC transcript-plasma protein association results from nebula
 vsmc_plasma_raw <- s3readRDS("Proteomics/vsmc_nebula_plasma_soma_res_kpmp.rds", "attempt", region = "")
 vsmc_plasma <- process_nebula_results(vsmc_plasma_raw$results, pval_col = "p_log2(protein)")$results
 vsmc_plasma <- vsmc_plasma %>%
@@ -755,8 +729,9 @@ vsmc_plasma <- vsmc_plasma %>%
 ```
 
 ```{r echo = F}
-plot_volcano(vsmc_plasma, 
-             fc = "logFC_log2(protein)", 
+# volcano plot for VSMC transcript-protein association and directional concordance
+plot_volcano(vsmc_plasma,
+             fc = "logFC_log2(protein)",
              p_col = "p_log2(protein)", 
              x_axis = "logFC log2(protein)", 
              y_axis = "-log10(p.value)",
@@ -771,22 +746,24 @@ create_directional_volcano(
   protein_data = vsmc_plasma,
   cell_type_name = "VSMC"
 )
-ggsave(file.path(root_path, "ATTEMPT/Results/Figures/Proteomics/Volcano Plots/plasma_vsmc.png"))
+ggsave(file.path(results_dir, "Figures/Proteomics/Volcano Plots/plasma_vsmc.png"))
   
 ```
 
 ```{r echo = F}
+# assess VSMC transcript-protein directional concordance
 vsmc_concordance_plasma <- concordance_by_celltype(
   biofluid_df = vsmc_plasma,
   scrna_df    = vsmc_kpmp,
   biofluid_label = "plasma",
   celltype = "VSMC",
-  out_dir = file.path(root_path, "ATTEMPT/Results/Somascan/Transcript concordance")
+  out_dir = file.path(results_dir, "Somascan/Transcript concordance")
 )
 ```
 
 
 ```{r echo = F}
+# load glomerular transcript-plasma protein association results from nebula
 glom_plasma_raw <- s3readRDS("Proteomics/glom_nebula_plasma_soma_res_kpmp.rds", "attempt", region = "")
 glom_plasma <- process_nebula_results(glom_plasma_raw$results, pval_col = "p_log2(protein)")$results
 glom_plasma <- glom_plasma %>%
@@ -794,7 +771,8 @@ glom_plasma <- glom_plasma %>%
 ```
 
 ```{r echo = F}
-plot_volcano(glom_plasma, fc = "logFC_log2(protein)", p_col = "p_log2(protein)", x_axis = "logFC log2(protein)", y_axis = "-log10(p.value)", 
+# volcano plot for glomerular transcript-protein association and directional concordance
+plot_volcano(glom_plasma, fc = "logFC_log2(protein)", p_col = "p_log2(protein)", x_axis = "logFC log2(protein)", y_axis = "-log10(p.value)",
              file_suffix = "_kpmp_glom_plasma",
              formula = "log2(protein) + treatment", cell_type = "Glomerular cells",
              positive_text = "Positively associated\nwith transcript",
@@ -806,20 +784,22 @@ create_directional_volcano(
   protein_data = glom_plasma,
   cell_type_name = "Glomerulus"
 )
-ggsave(file.path(root_path, "ATTEMPT/Results/Figures/Proteomics/Volcano Plots/plasma_glom.png"))
+ggsave(file.path(results_dir, "Figures/Proteomics/Volcano Plots/plasma_glom.png"))
 ```
 
 ```{r echo = F}
+# assess glomerular transcript-protein directional concordance
 glom_concordance_plasma <- concordance_by_celltype(
   biofluid_df = glom_plasma,
   scrna_df    = glom_kpmp,
   biofluid_label = "plasma",
   celltype = "Glom",
-  out_dir = file.path(root_path, "ATTEMPT/Results/Somascan/Transcript concordance")
+  out_dir = file.path(results_dir, "Somascan/Transcript concordance")
 )
 ```
 
 ```{r echo = F}
+# load immune cell transcript-plasma protein association results from nebula
 immune_plasma_raw <- s3readRDS("Proteomics/immune_nebula_plasma_soma_res_kpmp.rds", "attempt", region = "")
 immune_plasma <- process_nebula_results(immune_plasma_raw$results, pval_col = "p_log2(protein)")$results
 immune_plasma <- immune_plasma %>%
@@ -827,6 +807,7 @@ immune_plasma <- immune_plasma %>%
 ```
 
 ```{r echo = F}
+# volcano plot for immune transcript-protein association and directional concordance
 plot_volcano(immune_plasma, fc = "logFC_log2(protein)", p_col = "p_log2(protein)", x_axis = "logFC log2(protein)", y_axis = "-log10(p.value)", file_suffix = "_kpmp_immune_plasma",
              formula = "log2(protein) + treatment", cell_type = "Immune",
              positive_text = "Positively associated\nwith transcript",
@@ -838,20 +819,22 @@ create_directional_volcano(
   protein_data = immune_plasma %>% filter(`logFC_log2(protein)` > -10),
   cell_type_name = "Immune"
 )
-ggsave(file.path(root_path, "ATTEMPT/Results/Figures/Proteomics/Volcano Plots/plasma_immune.png"))
+ggsave(file.path(results_dir, "Figures/Proteomics/Volcano Plots/plasma_immune.png"))
 ```
 
 ```{r echo = F}
+# assess immune transcript-protein directional concordance
 immune_concordance_plasma <- concordance_by_celltype(
   biofluid_df = immune_plasma,
   scrna_df    = immune_kpmp,
   biofluid_label = "plasma",
   celltype = "Immune",
-  out_dir = file.path(root_path, "ATTEMPT/Results/Somascan/Transcript concordance")
+  out_dir = file.path(results_dir, "Somascan/Transcript concordance")
 )
 ```
 
 ```{r echo = F}
+# load endothelial cell transcript-plasma protein association results from nebula
 ec_plasma_raw <- s3readRDS("Proteomics/ec_nebula_plasma_soma_res_kpmp.rds", "attempt", region = "")
 ec_plasma <- process_nebula_results(ec_plasma_raw$results, pval_col = "p_log2(protein)")$results
 ec_plasma <- ec_plasma %>%
@@ -859,7 +842,8 @@ ec_plasma <- ec_plasma %>%
 ```
 
 ```{r echo = F}
-plot_volcano(ec_plasma, fc = "logFC_log2(protein)", p_col = "p_log2(protein)", x_axis = "logFC log2(protein)", y_axis = "-log10(p.value)", 
+# volcano plot for EC transcript-protein association and directional concordance
+plot_volcano(ec_plasma, fc = "logFC_log2(protein)", p_col = "p_log2(protein)", x_axis = "logFC log2(protein)", y_axis = "-log10(p.value)",
              file_suffix = "_kpmp_ec_plasma",
              formula = "log2(protein) + treatment", cell_type = "EC",
              positive_text = "Positively associated\nwith transcript",
@@ -871,20 +855,22 @@ create_directional_volcano(
   protein_data = ec_plasma %>% filter(`logFC_log2(protein)` > -10),
   cell_type_name = "EC"
 )
-ggsave(file.path(root_path, "ATTEMPT/Results/Figures/Proteomics/Volcano Plots/plasma_ec.png"))
+ggsave(file.path(results_dir, "Figures/Proteomics/Volcano Plots/plasma_ec.png"))
 ```
 
 ```{r echo = F}
+# assess EC transcript-protein directional concordance
 ec_concordance_plasma <- concordance_by_celltype(
   biofluid_df = ec_plasma,
   scrna_df    = ec_kpmp,
   biofluid_label = "plasma",
   celltype = "EC",
-  out_dir = file.path(root_path, "ATTEMPT/Results/Somascan/Transcript concordance")
+  out_dir = file.path(results_dir, "Somascan/Transcript concordance")
 )
 ```
 
 ```{r combinedho = F}
+# load combined cell type (EC+VSMC+Immune+Glom) transcript-protein results
 combined_plasma_raw <- s3readRDS("Proteomics/combined_nebula_plasma_soma_res_kpmp.rds", "attempt", region = "")
 combined_plasma <- process_nebula_results(combined_plasma_raw$results, pval_col = "p_log2(protein)")$results
 combined_plasma <- combined_plasma %>%
@@ -892,7 +878,8 @@ combined_plasma <- combined_plasma %>%
 ```
 
 ```{r combinedho = F}
-plot_volcano(combined_plasma, fc = "logFC_log2(protein)", p_col = "p_log2(protein)", x_axis = "logFC log2(protein)", y_axis = "-log10(p.value)", 
+# volcano plot for combined cell type transcript-protein association and concordance
+plot_volcano(combined_plasma, fc = "logFC_log2(protein)", p_col = "p_log2(protein)", x_axis = "logFC log2(protein)", y_axis = "-log10(p.value)",
              file_suffix = "_kpmp_combined_plasma",
              formula = "log2(protein) + treatment", 
              cell_type = "Combined (EC, VSMC, Immune, Glom)",
@@ -905,24 +892,24 @@ create_directional_volcano(
   protein_data = combined_plasma %>% filter(`logFC_log2(protein)` > -10),
   cell_type_name = "Combined (EC, VSMC, Immune, Glom)"
 )
-ggsave(file.path(root_path, "ATTEMPT/Results/Figures/Proteomics/Volcano Plots/plasma_combined.png"))
+ggsave(file.path(results_dir, "Figures/Proteomics/Volcano Plots/plasma_combined.png"))
 ```
 
 ```{r echo = F}
+# assess combined cell type transcript-protein directional concordance
 combined_concordance_plasma <- concordance_by_celltype(
   biofluid_df = combined_plasma,
   scrna_df    = combined_p_kpmp,
   biofluid_label = "plasma",
   celltype = "Combined",
-  out_dir = file.path(root_path, "ATTEMPT/Results/Somascan/Transcript concordance")
+  out_dir = file.path(results_dir, "Somascan/Transcript concordance")
 )
 ```
 
 # Looking for overlap between treatment DiD & proteomics DiD
 
 ```{r echo = F}
-## read mixed model results dataframe (rendered in Hyak)
-# process and read all results from ATTEMPT
+# redefine cell type groups for treatment DiD overlap analysis
 celltype_groups <- list(
   # PC              = c("CCD-PC", "CNT-PC", "dCCD-PC", "M-PC", "tPC-IC"),
   EC              = c("EC-AVR", "EC-GC", "EC-PTC", "EC-AEA", "EC-LYM", "EC/VSMC"),
@@ -934,11 +921,8 @@ celltype_groups <- list(
 )
 
 
-## read mixed model results dataframe (rendered in Hyak)
-# process and read all results from ATTEMPT
-# Full gene set
+# read grouped nebula DiD results for full gene set from S3
 for (cell in names(celltype_groups))  {
-print(paste0("Processing: ", cell))
   input_path <- paste0("grouped/", cell, "/ALL/nebula/", "grouped_", tolower(cell), "_kpmp_attempt_nebula_res_reml_pooled.rds")
   cell_df <- s3readRDS(input_path, bucket = "attempt", region = "")
 
@@ -949,10 +933,12 @@ print(paste0("Processing: ", cell))
   assign(var_name, processed$results)
 }
 
+# reload plasma DiD mixed model results
 did_res_plasma_mixed <- s3readRDS("Proteomics/plasma_proteomics_res.RDS", "attempt", region = "")
 ```
 
 ```{r echo = F}
+# run batch concordance between plasma proteomics DiD and scRNA DiD across cell types
 plasma_res <- batch_concordance_analysis(
   protein_data = did_res_plasma_mixed$results_annotated,  # This is correct
   transcript_data_list = list(EC = pt_kpmp, Immune = immune_kpmp, 
@@ -960,13 +946,14 @@ plasma_res <- batch_concordance_analysis(
                               Immune_lymphoid = immune_lymphoid_kpmp, 
                               VSMC_P_FIB = vsmc_p_fib_kpmp, POD = pod_kpmp),
   protein_source = 'plasma',
-  output_dir = "/Users/choiyej/Library/CloudStorage/OneDrive-SharedLibraries-UW/Laura Pyle - Bjornstad/Biostatistics Core Shared Drive/ATTEMPT/Results/Figures/Pathways/enrichr"
+  output_dir = file.path(results_dir, "Figures/Pathways/enrichr")
 )
 ```
 
 # Organ Age
 
 ```{r}
+# pass soma dataframe to python via reticulate for organ age estimation
 library(reticulate)
 py$soma <- soma
 ```
@@ -979,7 +966,7 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 import re
 
-# create a metadata df with record_id, sex, and age
+# prepare metadata (age, sex) and protein matrix for OrganAge input
 soma['Sex_F'] = (soma['sex'] == 'Female').astype(int)
 soma['record_id_visit'] = soma['record_id'].astype(str) + '_' + soma['visit'].astype(str)
 soma = soma.set_index('record_id_visit')
@@ -988,20 +975,18 @@ metadata_columns = ['age', 'Sex_F']
 soma_md = soma[metadata_columns].copy()
 soma_md = soma_md.rename(columns={'age': 'Age'})
 
-# create a df with record_id_visit and proteins
+# extract raw SomaScan protein columns and reformat IDs for OrganAge
 seq_columns = [col for col in soma.columns if re.match(r'^seq\.\d+\.\d+', col) and '_' not in col]
-len(seq_columns) # 11k panel
 soma_prot = soma[seq_columns].copy()
 soma_prot.columns = soma_prot.columns.str.replace('seq.', '', regex=False).str.replace('.', '-', regex=False)
 
-# calculate organ age
+# estimate organ-specific biological ages using OrganAge (v5 11k panel)
 data = OrganAge.CreateOrganAgeObject()
 data.add_data(soma_md, soma_prot)
 data.normalize(assay_version="v5")  #requires "v4" 5k, or "v4.1" 7k, or "v5" 11k
 res = data.estimate_organ_ages()
-res
 
-
+# plot kidney-specific predicted vs chronological age colored by age gap z-score
 toplot = res.loc[res.Organ=="Kidney"]
 toplot = toplot.sort_values("Age")
 sns.scatterplot(data=toplot, x="Age", y="Predicted_Age", 

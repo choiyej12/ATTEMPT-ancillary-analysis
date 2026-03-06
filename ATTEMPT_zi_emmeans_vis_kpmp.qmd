@@ -44,12 +44,15 @@ library(biomaRt)
 ```
 
 ```{r echo = F, include = F}
-source("~/GitHub/CHCO-Code/Petter Bjornstad/ATTEMPT/attempt_functions.R")
+# source shared ATTEMPT analysis functions (from this repository)
+library(here)
+source(here("attempt_functions.R"))
 ```
 
 ```{r include = F}
-## Create an S3 client
-keys <- fromJSON("/Users/choiyej/Library/CloudStorage/OneDrive-TheUniversityofColoradoDenver/Bjornstad Pyle Lab/keys.json")
+# configure S3 connection to Kopah (UW research storage)
+# NOTE: users must provide their own keys.json with AWS credentials
+keys <- fromJSON(Sys.getenv("ATTEMPT_KEYS_PATH", unset = "keys.json"))
 
 Sys.setenv(
   "AWS_ACCESS_KEY_ID" = keys$MY_ACCESS_KEY,
@@ -66,7 +69,7 @@ Sys.setenv(
 ## read mixed model results dataframe (rendered in Hyak)
 # process and read all results from ATTEMPT
 
-# Define genes to exclude by cell type
+# contaminating genes to filter out per cell type (likely from ambient RNA)
 genes_to_exclude <- list(
   IC = c("SLC12A1", "UMOD", "GSTA1", "GSTA2", "TAGLN", "SLC22A2", "AC104041.1", "CASR", "AC068051.1"),
   POD = c("PCDH7", "CNTN4"),
@@ -89,9 +92,10 @@ celltype_groups <- list(
 )
 
 ## read mixed model results dataframe (rendered in Hyak)
+# connect to Ensembl for gene annotations
 mart <- useMart("ensembl", dataset = "hsapiens_gene_ensembl")
 
-# Top 2000 HVG
+# read grouped HVG nebula results, filter contaminants, annotate with Ensembl gene descriptions
 for (cell in names(celltype_groups))  {
   input_path <- paste0("grouped/", cell, "/HVG/nebula/", "grouped_", tolower(cell), "_kpmp_attempt_nebula_res_reml_pooled.rds")
   cell_df <- s3readRDS(input_path, bucket = "attempt", region = "")
@@ -131,12 +135,11 @@ for (cell in names(celltype_groups))  {
   var_name <- paste0(tolower(cell), "_hvg_kpmp")
   assign(var_name, annotated_df, envir = .GlobalEnv)
   
-  write.csv(annotated_df, paste0("/Users/choiyej/Library/CloudStorage/OneDrive-SharedLibraries-UW/Laura Pyle - Bjornstad/Biostatistics Core Shared Drive/ATTEMPT/Results/nebula/", tolower(cell), "_kpmp_hvg_res.csv"), row.names = F)
+  write.csv(annotated_df, file.path(results_dir, "nebula", paste0(tolower(cell), "_kpmp_hvg_res.csv")), row.names = F)
 }
 
-# Top 2000 HVG subtypes
+# read individual subtype HVG nebula results, filter contaminants, annotate
 for (cell in unlist(celltype_groups))  {
-  print(paste0("Processing: ", cell))
   cell_clean <- gsub("/", "_", cell)
   input_path <- paste0("individual/", cell_clean, "/HVG/nebula/individual_", 
                        tolower(cell_clean),
@@ -147,7 +150,6 @@ for (cell in unlist(celltype_groups))  {
   
   # Check if processed results has 0 rows
   if (nrow(processed$results) == 0) {
-    print(paste0("Skipping ", cell, " - no rows in processed results"))
     next
   }
   
@@ -191,56 +193,19 @@ for (cell in unlist(celltype_groups))  {
   cell_clean <- gsub("\\+\\s", "_", cell_clean)
   lower_cell <- tolower(cell_clean)
   var_name <- paste0(lower_cell, "_hvg_kpmp")
-  print(var_name)
   assign(var_name, annotated_df, envir = .GlobalEnv)
   
   var_name <- paste0(lower_cell, "_hvg_kpmp_cov")
   assign(var_name, processed$overdispersion)
   
-  write.csv(annotated_df, paste0("/Users/choiyej/Library/CloudStorage/OneDrive-SharedLibraries-UW/Laura Pyle - Bjornstad/Biostatistics Core Shared Drive/ATTEMPT/Results/nebula/", tolower(cell_clean), "_kpmp_hvg_res.csv"), row.names = F)
+  write.csv(annotated_df, file.path(results_dir, "nebula", paste0(tolower(cell_clean), "_kpmp_hvg_res.csv")), row.names = F)
 }
-
-# custom <- c("DCT", "CD", "Glom", "VSMC", "Combined_p", "Combined_u")
-# 
-# # Full gene set
-# for (cell in custom)  {
-# print(paste0("Processing: ", cell))
-#   input_path <- paste0("grouped/", cell, "/ALL/nebula/", "grouped_", tolower(cell), "_kpmp_attempt_nebula_res_reml_pooled.rds")
-#   cell_df <- s3readRDS(input_path, bucket = "attempt", region = "")
-# 
-#   processed <- process_nebula_results(cell_df)
-#   lower_cell <- tolower(cell)
-#   var_name <- paste0(lower_cell, "_kpmp")
-# 
-#   assign(var_name, processed$results)
-#   write.csv(processed$results, paste0("/Users/choiyej/Library/CloudStorage/OneDrive-SharedLibraries-UW/Laura Pyle - Bjornstad/Biostatistics Core Shared Drive/ATTEMPT/Results/nebula/", tolower(cell), "_kpmp_res.csv"), row.names = F)
-# }
-# 
-# # Full gene set subtypes
-# for (cell in unlist(celltype_groups))  {
-# print(paste0("Processing: ", cell))
-#   cell <- gsub("/", "_", cell)
-#   input_path <- paste0("individual/", cell, "/ALL/nebula/individual_",
-#                        tolower(cell),
-#                        "_kpmp_attempt_nebula_res_reml_pooled.rds")
-#   cell_df <- s3readRDS(input_path, bucket = "attempt", region = "")
-# 
-#   processed <- process_nebula_results(cell_df)
-#   cell <- gsub("-", "_", cell)
-#   lower_cell <- tolower(cell)
-#   var_name <- paste0(lower_cell, "_kpmp")
-# 
-#   assign(var_name, processed$results)
-#   write.csv(processed$results, paste0("/Users/choiyej/Library/CloudStorage/OneDrive-SharedLibraries-UW/Laura Pyle - Bjornstad/Biostatistics Core Shared Drive/ATTEMPT/Results/nebula/", tolower(cell), "_kpmp_res.csv"), row.names = F)
-# 
-# }
 ```
 
 ```{r echo = F, eval = F}
-# save all as one excel spreadsheet with full gene names
+# save nebula results as Excel workbooks (top 50 and all genes per cell type)
 top50_wb <- createWorkbook()
 all_wb <- createWorkbook()
-# Loop through and extract top 50 genes per cell type
 for (cell in names(celltype_groups))  {
   var_name <- paste0(tolower(cell), "_hvg_kpmp")
   df <- get(var_name)
@@ -260,15 +225,14 @@ for (cell in names(celltype_groups))  {
   writeData(top50_wb, sheet = cell, x = top_genes)
 }
 
-# # Save the workbook
-saveWorkbook(all_wb, file = "/Users/choiyej/Library/CloudStorage/OneDrive-SharedLibraries-UW/Laura Pyle - Bjornstad/Biostatistics Core Shared Drive/ATTEMPT/Results/all_hvg_nebula_results_by_kpmp_celltype.xlsx", overwrite = TRUE)
-saveWorkbook(top50_wb, file = "/Users/choiyej/Library/CloudStorage/OneDrive-SharedLibraries-UW/Laura Pyle - Bjornstad/Biostatistics Core Shared Drive/ATTEMPT/Results/top50_hvg_nebula_results_by_kpmp_celltype.xlsx", overwrite = TRUE)
+saveWorkbook(all_wb, file = file.path(results_dir, "all_hvg_nebula_results_by_kpmp_celltype.xlsx"), overwrite = TRUE)
+saveWorkbook(top50_wb, file = file.path(results_dir, "top50_hvg_nebula_results_by_kpmp_celltype.xlsx"), overwrite = TRUE)
 ```
 
 #### IPA input save
 
 ```{r echo = F, eval = F}
-# save input for IPA
+# save formatted CSVs for Ingenuity Pathway Analysis (IPA) input
 for (cell in names(celltype_groups)){
   ## HVG
   hvg_df <- get(paste0(tolower(cell), "_hvg_kpmp"))
@@ -276,8 +240,8 @@ for (cell in names(celltype_groups)){
     dplyr::select(Gene, `logFC_treatmentDapagliflozin:visitPOST`, `p_treatmentDapagliflozin:visitPOST`, fdr)
   colnames(hvg_ipa_DiD) <- c("Gene", "Log Fold Change", "Expr p-value", "Expr False Discovery Rate")
   
-  write.csv(hvg_ipa_DiD, paste0("/Users/choiyej/Library/CloudStorage/OneDrive-SharedLibraries-UW/Laura Pyle - Bjornstad/Biostatistics Core Shared Drive/ATTEMPT/Results/emmeans/kpmp/nebula/", 
-                            tolower(cell), "_nebula_pooled_ipa_input_DiD.csv"), row.names = F)
+  write.csv(hvg_ipa_DiD, file.path(results_dir, "emmeans/kpmp/nebula",
+                            paste0(tolower(cell), "_nebula_pooled_ipa_input_DiD.csv")), row.names = F)
   
     ## FULL
   df <- get(paste0(tolower(cell), "_kpmp"))
@@ -285,8 +249,8 @@ for (cell in names(celltype_groups)){
     dplyr::select(Gene, `logFC_treatmentDapagliflozin:visitPOST`, `p_treatmentDapagliflozin:visitPOST`, fdr)
   colnames(ipa_DiD) <- c("Gene", "Log Fold Change", "Expr p-value", "Expr False Discovery Rate")
   
-  write.csv(ipa_DiD, paste0("/Users/choiyej/Library/CloudStorage/OneDrive-SharedLibraries-UW/Laura Pyle - Bjornstad/Biostatistics Core Shared Drive/ATTEMPT/Results/emmeans/kpmp/nebula/", 
-                            tolower(cell), "_nebula_pooled_ipa_input_DiD_full.csv"), row.names = F)
+  write.csv(ipa_DiD, file.path(results_dir, "emmeans/kpmp/nebula",
+                            paste0(tolower(cell), "_nebula_pooled_ipa_input_DiD_full.csv")), row.names = F)
   
 }
 ```
@@ -294,13 +258,14 @@ for (cell in names(celltype_groups)){
 # Volcanos
 
 ```{r echo = F}
-# HVG
+# volcano plots for DiD interaction term (treatment x visit) per cell type
+# HVG gene set
 for (cell in names(celltype_groups)) {
   lower_cell <- tolower(cell)
   df_name <- paste0(lower_cell, "_hvg_kpmp")
   df <- get(df_name)
-  
-  plot_volcano(df, "logFC_treatmentDapagliflozin:visitPOST", 
+
+  plot_volcano(df, "logFC_treatmentDapagliflozin:visitPOST",
              "p_treatmentDapagliflozin:visitPOST",
              NULL,
              "logFC Treatment(Dapagliflozin):Visit(POST)", 
@@ -320,7 +285,7 @@ plot_volcano(df, "logFC_treatmentDapagliflozin:visitPOST",
   
 }
 
-# ALL
+# full gene set volcano plots
 for (cell in names(celltype_groups)) {
   lower_cell <- tolower(cell)
   df_name <- paste0(lower_cell, "_kpmp")
@@ -344,30 +309,6 @@ plot_volcano(df, "logFC_treatmentDapagliflozin:visitPOST",
              formula = "treatment * visit",
              cell_type = cell)
 }
-
-
-# cell = "EC_GC"
-#   lower_cell <- tolower(cell)
-#   df_name <- paste0(lower_cell, "_hvg_kpmp")
-#   df <- get(df_name)
-#   
-#   plot_volcano(df, "logFC_treatmentDapagliflozin:visitPOST", 
-#              "p_treatmentDapagliflozin:visitPOST",
-#              NULL,
-#              "logFC Treatment(Dapagliflozin):Visit(POST)", 
-#              "-log10(p-value)",
-#              paste0("nebula/", df_name, "_kpmp_DiD"),
-#              formula = "treatment * visit",
-#              cell_type = cell)
-# 
-# plot_volcano(df, "logFC_treatmentDapagliflozin:visitPOST", 
-#              "fdr",
-#              NULL,
-#              "logFC Treatment(Dapagliflozin):Visit(POST)", 
-#              "-log10(FDR adjusted p-value)",
-#              paste0("nebula/", df_name, "_kpmp_DiD"),
-#              formula = "treatment * visit",
-#              cell_type = cell)
 ```
 
 ### PT
@@ -375,6 +316,7 @@ plot_volcano(df, "logFC_treatmentDapagliflozin:visitPOST",
 #### PT Subtypes
 
 ```{r echo = F}
+# combined volcano + subtype dot plot for PT cell types
 pt_plots <- create_gene_expression_plots(
   main_results = pt_hvg_kpmp,
   subtype_results_list = list(
@@ -389,7 +331,7 @@ pt_plots <- create_gene_expression_plots(
   volcano_text_size = 15,
   volcano_caption_size = 12,
   formula = "treatment * visit",
-  output_dir = "/Users/choiyej/Library/CloudStorage/OneDrive-SharedLibraries-UW/Laura Pyle - Bjornstad/Biostatistics Core Shared Drive/ATTEMPT/Results/Figures/Dot Plots/"
+  output_dir = file.path(results_dir, "Figures/Dot Plots")
 )
 pt_plots$combined_plot
 ```
@@ -400,6 +342,7 @@ pt_plots$combined_plot
 #### TAL Subtypes
 
 ```{r echo = F}
+# combined volcano + subtype dot plot for TAL cell types
 tal_plots <- create_gene_expression_plots(
   main_results = tal_hvg_kpmp,
   subtype_results_list = list(
@@ -415,7 +358,7 @@ tal_plots <- create_gene_expression_plots(
   volcano_text_size = 15,
   volcano_caption_size = 12,
   formula = "treatment * visit",
-  output_dir = "/Users/choiyej/Library/CloudStorage/OneDrive-SharedLibraries-UW/Laura Pyle - Bjornstad/Biostatistics Core Shared Drive/ATTEMPT/Results/Figures/Dot Plots/"
+  output_dir = file.path(results_dir, "Figures/Dot Plots")
 )
 tal_plots$combined_plot
 ```
@@ -425,6 +368,7 @@ tal_plots$combined_plot
 #### PC Subtypes
 
 ```{r echo = F}
+# combined volcano + subtype dot plot for PC cell types
 pc_plots <- create_gene_expression_plots(
   main_results = pc_hvg_kpmp,
   subtype_results_list = list(
@@ -441,7 +385,7 @@ pc_plots <- create_gene_expression_plots(
   volcano_text_size = 15,
   volcano_caption_size = 12,
   formula = "treatment * visit",
-  output_dir = "/Users/choiyej/Library/CloudStorage/OneDrive-SharedLibraries-UW/Laura Pyle - Bjornstad/Biostatistics Core Shared Drive/ATTEMPT/Results/Figures/Dot Plots/"
+  output_dir = file.path(results_dir, "Figures/Dot Plots")
 )
 ```
 
@@ -450,6 +394,7 @@ pc_plots <- create_gene_expression_plots(
 #### Immune Subtypes
 
 ```{r echo = F}
+# combined volcano + subtype dot plot for all immune cell types
 immune_plots <- create_gene_expression_plots(
   main_results = immune_hvg_kpmp,
   subtype_results_list = list(
@@ -469,7 +414,7 @@ immune_plots <- create_gene_expression_plots(
   volcano_text_size = 15,
   volcano_caption_size = 12,
   formula = "treatment * visit",
-  output_dir = "/Users/choiyej/Library/CloudStorage/OneDrive-SharedLibraries-UW/Laura Pyle - Bjornstad/Biostatistics Core Shared Drive/ATTEMPT/Results/Figures/Dot Plots/"
+  output_dir = file.path(results_dir, "Figures/Dot Plots")
 )
 
 ```
@@ -480,6 +425,7 @@ immune_plots <- create_gene_expression_plots(
 #### Immune Subtypes (Myeloid)
 
 ```{r echo = F}
+# combined volcano + subtype dot plot for myeloid immune subtypes
 immune_myeloid_plots <- create_gene_expression_plots(
   main_results = immune_myeloid_hvg_kpmp,
   subtype_results_list = list(
@@ -495,7 +441,7 @@ immune_myeloid_plots <- create_gene_expression_plots(
   volcano_text_size = 15,
   volcano_caption_size = 12,
   formula = "treatment * visit",
-  output_dir = "/Users/choiyej/Library/CloudStorage/OneDrive-SharedLibraries-UW/Laura Pyle - Bjornstad/Biostatistics Core Shared Drive/ATTEMPT/Results/Figures/Dot Plots/"
+  output_dir = file.path(results_dir, "Figures/Dot Plots")
 )
 
 ```
@@ -505,6 +451,7 @@ immune_myeloid_plots <- create_gene_expression_plots(
 #### Immune Subtypes (Lymphoid)
 
 ```{r echo = F}
+# combined volcano + subtype dot plot for lymphoid immune subtypes
 immune_lymphoid_plots <- create_gene_expression_plots(
   main_results = immune_lymphoid_hvg_kpmp,
   subtype_results_list = list(
@@ -520,7 +467,7 @@ immune_lymphoid_plots <- create_gene_expression_plots(
   volcano_text_size = 15,
   volcano_caption_size = 12,
   formula = "treatment * visit",
-  output_dir = "/Users/choiyej/Library/CloudStorage/OneDrive-SharedLibraries-UW/Laura Pyle - Bjornstad/Biostatistics Core Shared Drive/ATTEMPT/Results/Figures/Dot Plots/"
+  output_dir = file.path(results_dir, "Figures/Dot Plots")
 )
 
 ```
@@ -530,6 +477,7 @@ immune_lymphoid_plots <- create_gene_expression_plots(
 #### IC Subtypes
 
 ```{r echo = F}
+# combined volcano + subtype dot plot for IC cell types
 ic_plots <- create_gene_expression_plots(
   main_results = ic_hvg_kpmp,
   subtype_results_list = list(
@@ -544,7 +492,7 @@ ic_plots <- create_gene_expression_plots(
   volcano_text_size = 15,
   volcano_caption_size = 12,
   formula = "treatment * visit",
-  output_dir = "/Users/choiyej/Library/CloudStorage/OneDrive-SharedLibraries-UW/Laura Pyle - Bjornstad/Biostatistics Core Shared Drive/ATTEMPT/Results/Figures/Dot Plots/"
+  output_dir = file.path(results_dir, "Figures/Dot Plots")
 )
 ic_plots$volcano_plot
 ```
@@ -555,6 +503,7 @@ ic_plots$volcano_plot
 #### EC Subtypes
 
 ```{r echo = F}
+# combined volcano + subtype dot plot for EC cell types
 ec_plots <- create_gene_expression_plots(
   main_results = ec_hvg_kpmp,
   subtype_results_list = list(
@@ -572,7 +521,7 @@ ec_plots <- create_gene_expression_plots(
   volcano_text_size = 15,
   volcano_caption_size = 12,
   formula = "treatment * visit",
-  output_dir = "/Users/choiyej/Library/CloudStorage/OneDrive-SharedLibraries-UW/Laura Pyle - Bjornstad/Biostatistics Core Shared Drive/ATTEMPT/Results/Figures/Dot Plots/"
+  output_dir = file.path(results_dir, "Figures/Dot Plots")
 )
 ```
 
@@ -582,6 +531,7 @@ ec_plots <- create_gene_expression_plots(
 #### FIBVSMCP Subtypes
 
 ```{r echo = F}
+# combined volcano + subtype dot plot for VSMC/P and FIB
 vsmc_p_fib_plots <- create_gene_expression_plots(
   main_results = vsmc_p_fib_hvg_kpmp,
   subtype_results_list = list(
@@ -595,13 +545,14 @@ vsmc_p_fib_plots <- create_gene_expression_plots(
   volcano_text_size = 15,
   volcano_caption_size = 12,
   formula = "treatment * visit",
-  output_dir = "/Users/choiyej/Library/CloudStorage/OneDrive-SharedLibraries-UW/Laura Pyle - Bjornstad/Biostatistics Core Shared Drive/ATTEMPT/Results/Figures/Dot Plots/"
+  output_dir = file.path(results_dir, "Figures/Dot Plots")
 )
 ```
 
 ### POD
 
 ```{r echo = F}
+# volcano + dot plot for POD (HVG gene set)
 pod_hvg_plots <- create_gene_expression_plots(
   main_results = pod_hvg_kpmp,
   subtype_results_list = list(
@@ -613,12 +564,13 @@ pod_hvg_plots <- create_gene_expression_plots(
   full_formula = T,
   volcano_text_size = 15,
   volcano_caption_size = 12,
-  output_dir = "/Users/choiyej/Library/CloudStorage/OneDrive-SharedLibraries-UW/Laura Pyle - Bjornstad/Biostatistics Core Shared Drive/ATTEMPT/Results/Figures/Dot Plots/"
+  output_dir = file.path(results_dir, "Figures/Dot Plots")
 )
 pod_hvg_plots$combined_plot
 ```
 
 ```{r echo = F}
+# volcano + dot plot for POD (full gene set)
 pod_plots <- create_gene_expression_plots(
   main_results = pod_kpmp,
   subtype_results_list = list(
@@ -630,21 +582,15 @@ pod_plots <- create_gene_expression_plots(
   full_formula = T,
   volcano_text_size = 15,
   volcano_caption_size = 12,
-  output_dir = "/Users/choiyej/Library/CloudStorage/OneDrive-SharedLibraries-UW/Laura Pyle - Bjornstad/Biostatistics Core Shared Drive/ATTEMPT/Results/Figures/Dot Plots/"
+  output_dir = file.path(results_dir, "Figures/Dot Plots")
 )
 ```
 
 ## Combined volcano
 
 ```{r echo = F}
-# plot_volcano(pt_hvg_kpmp, "logFC_treatmentDapagliflozin:visitPOST", 
-#              "fdr",
-#              "PT (REML & pooled Offset)", 
-#              "logFC Treatment(Dapagliflozin):Visit(POST)", 
-#              "-log10(FDR adjusted p-value)",
-#              "nebula/pt_hvg_kpmp_DiD")
-
-combined_nebula_reml_pooled <- 
+# combine all cell types into one df for cross-cell-type jitter plot
+combined_nebula_reml_pooled <-
   rbind(pt_hvg_kpmp %>%
           mutate(celltype = "PT"), 
         tal_hvg_kpmp %>%
@@ -684,7 +630,7 @@ combined_nebula_reml_pooled$celltype <- factor(combined_nebula_reml_pooled$cellt
                                                                 "VSMC_P_FIB", "Immune", "Immune (Lymphoid)", 
                                                                 "Immune (Myeloid)"))
 
-# volcano plot with no label
+# jitter plot of DiD logFC across cell types, colored by FDR significance
 combined_nebula_reml_pooled %>%
   filter(`logFC_treatmentDapagliflozin:visitPOST` < 10) %>%
   ggplot(aes(x = celltype, 
@@ -702,10 +648,10 @@ combined_nebula_reml_pooled %>%
   labs(x = NULL, 
        y = "DiD") +
   scale_color_manual(values = c("#457b9d", "#ced4da", "#f28482"))
-ggsave("/Users/choiyej/Library/CloudStorage/OneDrive-SharedLibraries-UW/Laura Pyle - Bjornstad/Biostatistics Core Shared Drive/ATTEMPT/Results/Figures/Cell type comparison/celltype_deg_combined_kpmp.png", width = 5, height = 4, dpi = 600)
+ggsave(file.path(results_dir, "Figures/Cell type comparison", "celltype_deg_combined_kpmp.png"), width = 5, height = 4, dpi = 600)
 
 
-# find genes that are significant in more than one celltype
+# find genes significant (FDR < 0.05) in more than one cell type
 shared_genes <- combined_nebula_reml_pooled %>%
   filter(fdr < 0.05) %>%
   group_by(Gene) %>%
@@ -738,7 +684,7 @@ combined_nebula_reml_pooled %>%
        y = "Interaction logFC") +
   scale_color_manual(values = c("#457b9d", "#ced4da", "#f28482"))
 
-# label genes in TCA cycle
+# jitter plot with TCA cycle gene labels highlighted
 tca_genes <- c(
   "ACO1", "ACO2", "IDH1", "IDH2", "IDH3A", "IDH3B", "IDH3G", "OGDH", "OGDHL",
   "SUCLA2", "SUCLG1", "SUCLG2", "SDHA", "SDHB", "SDHC", "SDHD", "FH", "MDH1",
@@ -770,7 +716,7 @@ combined_nebula_reml_pooled %>%
        y = "Interaction logFC") +
   scale_color_manual(values = c("#457b9d", "#ced4da", "#f28482"))
 
-# label genes in oxphos cycle
+# jitter plot with oxidative phosphorylation gene labels highlighted
 oxphos_genes <- c(
   "NDUFS6",  "SDHB", "SDHC", "SDHD",
   "UQCRC1", "UQCRC2", "COX4I1", "COX4I2", "ATP5PF"
@@ -799,14 +745,6 @@ combined_nebula_reml_pooled %>%
   labs(x = NULL, 
        y = "Interaction logFC") +
   scale_color_manual(values = c("#457b9d", "#ced4da", "#f28482"))
-
-# ggsave(
-#   filename = "",
-#   width = 4,
-#   height = 4,
-#   dpi = 300
-# )
-
 ```
 
 ## Number of DEGs
@@ -827,7 +765,7 @@ celltype_groups <- list(
 celltype_list <- tolower(names(celltype_groups))
 names_hvg_kpmp <- paste0(celltype_list, "_hvg_kpmp")
 
-# Create a named list of data frames
+# combine all cell types and count positive/negative DEGs (FDR < 0.05)
 df_list <- mget(names_hvg_kpmp)
 names(df_list) <- toupper(celltype_list)  # Set uppercase names for celltype labeling
 
@@ -863,8 +801,9 @@ deg_summary_wide <- combined %>%
   pivot_wider(names_from = celltype, values_from = n, values_fill = 0) %>%
   as.data.frame()
 
-save(deg_summary_wide, file = "/Users/choiyej/Library/CloudStorage/OneDrive-SharedLibraries-UW/Laura Pyle - Bjornstad/Biostatistics Core Shared Drive/ATTEMPT/Results/model comparison/celltype_deg_comparison_kpmp.RData")
+save(deg_summary_wide, file = file.path(results_dir, "model comparison", "celltype_deg_comparison_kpmp.RData"))
 
+# stacked barplot of positive and negative DEG counts per cell type
 deg_summary %>%
   mutate(Freq = case_when(direction_fdr == "-" ~ -Freq, T ~ Freq)) %>%
   ggplot(aes(x = celltype, y = Freq, fill = direction_fdr)) +
@@ -884,15 +823,14 @@ deg_summary %>%
   labs(fill = "DiD Direction", 
        x = NULL)
 
-ggsave("/Users/choiyej/Library/CloudStorage/OneDrive-SharedLibraries-UW/Laura Pyle - Bjornstad/Biostatistics Core Shared Drive/ATTEMPT/Results/Figures/Cell type comparison/celltype_deg_stacked_barplot_kpmp.png",
+ggsave(file.path(results_dir, "Figures/Cell type comparison", "celltype_deg_stacked_barplot_kpmp.png"),
        width = 5, height = 4, dpi = 600)
 ```
 
 ## Transcript overlap analysis
 
 ```{r echo = F}
-# upset plot
-# combined
+# upset plot showing overlap of DEGs (FDR < 0.05, |logFC| > 0.5) across cell types
 upset_combined_dat <- combined %>%
   filter(fdr < 0.05) %>%
   mutate(direction_fdr = case_when(`logFC_treatmentDapagliflozin:visitPOST` > 0.5 ~ "+",
@@ -917,17 +855,19 @@ vertical_upset(
   multi_bar_fill = "#588b8b"
 ) + theme_transparent
 
-ggsave(filename = "/Users/choiyej/Library/CloudStorage/OneDrive-SharedLibraries-UW/Laura Pyle - Bjornstad/Biostatistics Core Shared Drive/ATTEMPT/Results/Figures/Cell type comparison/celltype_deg_upset_kpmp.png",
+ggsave(filename = file.path(results_dir, "Figures/Cell type comparison", "celltype_deg_upset_kpmp.png"),
        width = 5, height = 10, dpi = 300,  bg = "transparent")
 
 ```
 
 ```{r echo = F}
+# chord diagram of shared DEGs between cell types with blended colors
 combined_sig <- combined %>%
   filter(fdr < 0.05) %>%
   dplyr::select(Gene, celltype) %>%
   filter(celltype %nin% c("IMMUNE_MYELOID", "IMMUNE_LYMPHOID"))
 
+# count genes unique to each cell type for self-links in the chord diagram
 unique_genes_per_celltype <- combined_sig %>%
   group_by(Gene) %>%
   mutate(n_celltypes = n()) %>%
@@ -937,8 +877,8 @@ unique_genes_per_celltype <- combined_sig %>%
   dplyr::rename(unique_genes = n) %>%
   mutate(unique_genes = unique_genes/2) # duplicates plotted
 
+# build pairwise shared gene count matrix for chord diagram
 chord_plot_dat <- combined_sig %>%
-  # Self-join to find all celltype pairs for each gene
   inner_join(combined_sig, by = "Gene", suffix = c("_1", "_2"), relationship = "many-to-many") %>%
   # # Remove self-pairs (same celltype)
   filter(celltype_1 != celltype_2) %>%
@@ -962,10 +902,7 @@ cell_types <- rownames(chord_plot_dat)
 cell_colors <- setNames(c("#f26b21", "#fcec52", "#cbdb47", "#99ca3c", 
                           "#208b3a", "#fbb040", "#f78e31"), cell_types)
 
-# cell_colors <- setNames(c("#1", "#4", "#5", "#6", 
-#                           "#7", "#3", "#2"), cell_types)
-
-# Create blended colors for ribbons
+# blend two cell type colors for chord diagram ribbon colors
 col_fun_blend <- function(mat) {
   n <- nrow(mat)
   col_mat <- matrix(NA, n, n)
@@ -1000,7 +937,7 @@ logical_matrix <- matrix(TRUE,
 diag(logical_matrix) <- FALSE
 
 # Open PNG device
-png("/Users/choiyej/Library/CloudStorage/OneDrive-SharedLibraries-UW/Laura Pyle - Bjornstad/Biostatistics Core Shared Drive/ATTEMPT/Results/Figures/Proportions/celltype_deg_chordplot.png", width = 800, height = 800, res = 150)
+png(file.path(results_dir, "Figures/Proportions", "celltype_deg_chordplot.png"), width = 800, height = 800, res = 150)
 
 # Your plotting code
 circos.clear()
@@ -1031,11 +968,6 @@ circos.clear()
 circos.par("track.height" = 0.1, 
            "gap.after" = rep(3, length(cell_types)),
            "start.degree" = 90)
-
-# par(
-#   family = "Outfit", cex = 2, col = "black", # font family, size, color
-#   mai = rep(0.5, 4) # plot margin in inches
-# ) 
 
 # Create chord diagram
 chordDiagram(chord_plot_dat, 
@@ -1088,6 +1020,7 @@ circos.clear()
 ```
 
 ```{r echo = F}
+# cross-cell-type concordance table: wide format showing DiD direction per cell type per gene
 upset_combined_df %>%
   arrange(desc(lengths(celltype)))
 
@@ -1108,25 +1041,24 @@ combined_wide <- combined %>%
   ungroup() %>%
   arrange(desc(n_total))
 
-save(combined_wide, file = "/Users/choiyej/Library/CloudStorage/OneDrive-SharedLibraries-UW/Laura Pyle - Bjornstad/Biostatistics Core Shared Drive/ATTEMPT/Results/model comparison/celltype_deg_concordance.RData")
+save(combined_wide, file = file.path(results_dir, "model comparison", "celltype_deg_concordance.RData"))
 
 
+# genes significant in 4+ cell types
 gene_list_4 <- combined_wide %>%
   filter(n_total >= 4) %>%
   pull(Gene)
 
-save(gene_list_4, file = "/Users/choiyej/Library/CloudStorage/OneDrive-SharedLibraries-UW/Laura Pyle - Bjornstad/Biostatistics Core Shared Drive/ATTEMPT/Results/model comparison/gene_list_greater_than_3.RData")
+save(gene_list_4, file = file.path(results_dir, "model comparison", "gene_list_greater_than_3.RData"))
 
 ```
 
 ## IPA pathway results
 
 ```{r echo = F}
-# read in all the results by looping through cell types
-names(celltype_groups)
-
+# read IPA pathway analysis results for each cell type
 for (cell in names(celltype_groups)){
-  ipa_res <- read_excel(paste0("/Users/choiyej/Library/CloudStorage/OneDrive-SharedLibraries-UW/Laura Pyle - Bjornstad/Biostatistics Core Shared Drive/ATTEMPT/Results/IPA/kpmp/nebula/full ", tolower(cell), "_kpmp_DiD.xls"), skip = 1)
+  ipa_res <- read_excel(file.path(results_dir, "IPA/kpmp/nebula", paste0("full ", tolower(cell), "_kpmp_DiD.xls")), skip = 1)
   colnames(ipa_res) <- c("pathway", "neg_log_p", "ratio", "z", "genes")
   var_name = paste0(tolower(cell), "_kpmp_ipa")
   assign(var_name, ipa_res, envir = .GlobalEnv)
@@ -1135,9 +1067,10 @@ for (cell in names(celltype_groups)){
 
 
 ```{r echo = F}
+# horizontal bar plots of top 20 IPA pathways per cell type, colored by z-score
 for (cell in names(celltype_groups)) {
   df <- get(paste0(tolower(cell), "_kpmp_ipa"))
-  
+
   df_top <- df %>%
     arrange(desc(neg_log_p)) %>%
     filter(!is.na(z)) %>%
@@ -1165,13 +1098,13 @@ for (cell in names(celltype_groups)) {
     scale_x_continuous(
       expand = expansion(mult = c(0, 0)))
   
-  ggsave(paste0("/Users/choiyej/Library/CloudStorage/OneDrive-SharedLibraries-UW/Laura Pyle - Bjornstad/Biostatistics Core Shared Drive/ATTEMPT/Results/Figures/Pathways/nebula/kpmp/full_", tolower(cell), "_ipa.png"))
+  ggsave(file.path(results_dir, "Figures/Pathways/nebula/kpmp", paste0("full_", tolower(cell), "_ipa.png")))
 }
 ```
 # GSEA
 
 ```{r echo = F}
-# GSEA with full gene set model (not HVG)
+# run fGSEA on full gene set (hallmark, reactome, GO) and save results
 for (cell in names(celltype_groups)) {
   df <- get(paste0(tolower(cell), "_kpmp"))
   
@@ -1181,15 +1114,16 @@ for (cell in names(celltype_groups)) {
                                 nPermSimple = 100000,
                                 references = c("hallmark", "reactome", "go", "full"))
   
-  saveRDS(gsea_list, paste0("/Users/choiyej/Library/CloudStorage/OneDrive-SharedLibraries-UW/Laura Pyle - Bjornstad/Biostatistics Core Shared Drive/ATTEMPT/Results/GSEA/full_", tolower(cell), "_gsea.RDS"))
+  saveRDS(gsea_list, file.path(results_dir, "GSEA", paste0("full_", tolower(cell), "_gsea.RDS")))
   
 }
 
+# export hallmark GSEA results as CSVs
 for (cell in names(celltype_groups)) {
-  rdsfile <- readRDS(paste0("/Users/choiyej/Library/CloudStorage/OneDrive-SharedLibraries-UW/Laura Pyle - Bjornstad/Biostatistics Core Shared Drive/ATTEMPT/Results/GSEA/full_", tolower(cell), "_gsea.RDS"))
+  rdsfile <- readRDS(file.path(results_dir, "GSEA", paste0("full_", tolower(cell), "_gsea.RDS")))
   hallmark_file <- rdsfile$hallmark %>%
     dplyr::select(-leadingEdge)
-  write.csv(hallmark_file, paste0("/Users/choiyej/Library/CloudStorage/OneDrive-SharedLibraries-UW/Laura Pyle - Bjornstad/Biostatistics Core Shared Drive/ATTEMPT/Results/GSEA/hallmark_", tolower(cell), "_gsea.csv"), row.names = F, na = "")
+  write.csv(hallmark_file, file.path(results_dir, "GSEA", paste0("hallmark_", tolower(cell), "_gsea.csv")), row.names = F, na = "")
 }
 
 ```

@@ -13,7 +13,7 @@ format:
 
 ```{r libraries, message = F, warning=F}
 #| include: false
-source("/mmfs1/gscratch/togo/yejichoi/CHCO-Code/Petter Bjornstad/ATTEMPT/attempt_functions.R")
+# load required packages for pseudotime and trajectory analysis
 library(future)
 library(future.apply)
 library(tidyverse)
@@ -27,9 +27,7 @@ library(arsenal)
 library(Biobase)
 library(msigdbr)
 library(kableExtra)
-# library(knitr)
 library(REDCapR)
-# library(data.table)
 library(emmeans)
 library(NMF)
 library(pheatmap)
@@ -52,7 +50,7 @@ library(jsonlite)
 library(dplyr)
 library(glmmTMB)
 library(reshape2)
-library(broom.mixed) 
+library(broom.mixed)
 library(foreach)
 library(doParallel)
 library(nebula)
@@ -64,7 +62,6 @@ library(CellChat)
 library(liana)
 library(magrittr)
 library(circlize)
-library(slingshot)
 library(uwot)
 library(mclust, quietly = TRUE)
 library(condiments)
@@ -72,59 +69,50 @@ library(plotly)
 library(grDevices)
 library(lme4)
 library(lmerTest)
-library(emmeans)
 library(htmlwidgets)
 library(mixtools)
 library(quantreg)
+library(here)
+
+# source shared ATTEMPT analysis functions (from this repository)
+source(here("attempt_functions.R"))
 ```
 
 ```{r include = F}
-reticulate::use_python("/mmfs1/gscratch/togo/yejichoi/mypy/bin/python", required = T)
+# configure Python environment for S3 access via boto3
+reticulate::use_python(Sys.getenv("ATTEMPT_PYTHON_PATH", unset = "python3"), required = T)
 reticulate::repl_python()
 reticulate::py_config()
-# set up Kopah connection
-## Load boto3 and pandas
+
+# set up Kopah S3 connection via boto3
 boto3 <- reticulate::import("boto3")
 pd <- reticulate::import("pandas")
 
-## Create an S3 client
-keys <- fromJSON("/mmfs1/home/yejichoi/keys.json")
+# configure S3 credentials
+# NOTE: users must provide their own keys.json with AWS credentials
+keys <- fromJSON(Sys.getenv("ATTEMPT_KEYS_PATH", unset = "keys.json"))
 session <- boto3$session$Session(
   aws_access_key_id = keys$MY_ACCESS_KEY,
   aws_secret_access_key = keys$MY_SECRET_KEY
 )
 
-## Create an S3 client with the session
+# create S3 client for Kopah storage
 s3 <- session$client("s3", endpoint_url = "https://s3.kopah.uw.edu")
 
 ```
 
 ```{r echo = F, eval = T}
-# Read in clean seurat object saved from attempt_CROC_analysis.qmd
+# download cleaned Seurat object from S3 for pseudotime analysis
 temp_file <- tempfile(fileext = ".rds")
 s3$download_file("attempt", 'cleaned_data/attempt_clean_so.rds', temp_file)
 attempt_so <- readRDS(temp_file)
 ``` 
 
-```{r echo = F}
-# clustering cells
-# cl1 <- Mclust(rd1)$classification
-# colData(sce_pt)$GMM <- cl1
-# 
-# library(RColorBrewer)
-# plot(rd1, col = brewer.pal(9,"Set1")[cl1], pch=16, asp = 1)
-# 
-# cl2 <- kmeans(rd1, centers = 4)$cluster
-# colData(sce_pt)$kmeans <- cl2
-# 
-# plot(rd1, col = brewer.pal(9,"Set1")[cl2], pch=16, asp = 1)
-# 
-# sce_pt_gmm <- slingshot(sce_pt, clusterLabels = 'GMM', reducedDim = 'PCA')
-```
 
 # PT (KPMP celltype)
 
 ```{r echo = F}
+# run slingshot pseudotime for PT KPMP subtypes, starting from PT-S1/S2
 pt_kpmp_results <- analyze_pseudotime_by_celltype(
   so = attempt_so,
   celltype_col = "KPMP_celltype",
@@ -135,15 +123,8 @@ pt_kpmp_results <- analyze_pseudotime_by_celltype(
   aws_s3 = s3,
   tau = c(0.25, 0.65, 0.85)
 )
-# 
-# pt_kpmp_results$pseudotime_df
-# pt_kpmp_results$sce_df$hba1c_delta
-# 
-# pt_kpmp_results$sce_df$hba1c_delta_dir <- ifelse(pt_kpmp_results$sce_df$hba1c_delta < 0, "neg", "pos")
-# wilcox.test(slingPseudotime_1 ~ hba1c_delta_dir, data = pt_kpmp_results$sce_df)
-# tapply(pt_kpmp_results$sce_df$slingPseudotime_1,
-#        pt_kpmp_results$sce_df$hba1c_delta_dir,
-#        median, na.rm = TRUE)
+
+# density plots of pseudotime by HbA1c change direction, weighted per subject
 pt_kpmp_results$clin_var_res$hba1c_delta$df_binned %>%
   filter(abs(hba1c_delta) > 0.3) %>%
   filter(!is.na(clinical_bin)) %>%
@@ -155,6 +136,7 @@ pt_kpmp_results$clin_var_res$hba1c_delta$df_binned %>%
   scale_fill_manual(values = c("POST" = "#f28482", "PRE" = "#457b9d", "No Change" = "#888888")) +
   theme(panel.background = element_blank())
 
+# density plots of pseudotime by TIR change direction
 pt_kpmp_results$clin_var_res$tir_delta$df_binned %>%
   filter(abs(tir_delta) > 0.5) %>%
   filter(!is.na(clinical_bin)) %>%
@@ -166,6 +148,7 @@ pt_kpmp_results$clin_var_res$tir_delta$df_binned %>%
   scale_fill_manual(values = c("POST" = "#f28482", "PRE" = "#457b9d", "No Change" = "#888888")) +
   theme(panel.background = element_blank())
 
+# density plots of pseudotime by mGFR change direction
 pt_kpmp_results$clin_var_res$mgfr_jodal_bsa$df_binned %>%
   filter(abs(mgfr_jodal_bsa) > 3) %>%
   filter(!is.na(clinical_bin)) %>%
@@ -176,7 +159,6 @@ pt_kpmp_results$clin_var_res$mgfr_jodal_bsa$df_binned %>%
   theme(panel.background = element_blank())
 
 pt_kpmp_results$clin_var_res$mgfr_jodal_bsa$df_binned %>%
-  # filter(abs(mgfr_jodal_bsa) > 3) %>%
   filter(!is.na(clinical_bin)) %>%
   group_by(subject_id, visit) %>%
   mutate(weights = 1/n()) %>% ungroup() %>%
@@ -187,20 +169,15 @@ pt_kpmp_results$clin_var_res$mgfr_jodal_bsa$df_binned %>%
   theme(panel.background = element_blank())
 
 
-dat <- pt_kpmp_results$sce_df 
+# mixed-effects models of pseudotime vs clinical variables (random intercept per subject)
+dat <- pt_kpmp_results$sce_df
 summary(lmer(slingPseudotime_1 ~ hba1c + (1|subject_id), data = dat))
 summary(lmer(slingPseudotime_1 ~ weight + (1|subject_id), data = dat))
 summary(lmer(slingPseudotime_1 ~ bmi + (1|subject_id), data = dat))
 summary(lmer(slingPseudotime_1 ~ mgfr_jodal_bsa + (1|subject_id), data = dat))
 summary(lmer(slingPseudotime_1 ~ cgm_tir + (1|subject_id), data = dat))
 
-# qqnorm(resid(m)); qqline(resid(m))
-# hist(resid(m), breaks = 50)
-# plot(fitted(m), resid(m))
-# ranef(m)$subject_id %>% as.data.frame() %>% ggplot(aes(`(Intercept)`)) + geom_histogram()
-# summary(m)
-
-# normalize by subject
+# per-subject weighted density of pseudotime by treatment group
 dat <- dat %>%
   group_by(subject_id, visit) %>%
   mutate(weights = 1/n()) %>%
@@ -216,6 +193,7 @@ pt_kpmp_results$p_pseudotime
 ```
 
 ```{r}
+# compute POST minus PRE weighted kernel density difference along pseudotime
 calc_density_diff <- function(df, direction_val,
                               direction_var = "direction",
                               use_weights = TRUE,
@@ -290,6 +268,7 @@ calc_density_diff <- function(df, direction_val,
              stringsAsFactors = FALSE)
 }
 
+# plot density difference curves (POST - PRE) for each clinical variable direction group
 plot_density_diff <- function(data, var_name, delta_symbol,
                               direction_var = "direction",
                               direction_vals = c("-", "+"),
@@ -331,8 +310,8 @@ plot_density_diff <- function(data, var_name, delta_symbol,
 }
 
 
-# Now create all your plots simply:
-p1 <- plot_density_diff(pt_kpmp_results$clin_var_res$hba1c_delta$df_binned, 
+# create density difference plots for each clinical variable
+p1 <- plot_density_diff(pt_kpmp_results$clin_var_res$hba1c_delta$df_binned,
                         "HbA1c", "\u0394HbA1c")
 
 p2 <- plot_density_diff(pt_kpmp_results$clin_var_res$tir_delta$df_binned, 
@@ -344,7 +323,8 @@ p3 <- plot_density_diff(pt_kpmp_results$clin_var_res$mgfr_jodal_bsa_delta$df_bin
 p4 <- plot_density_diff(pt_kpmp_results$clin_var_res$weight_delta$df_binned, 
                         "Weight", "\u0394Weight")
 
-p5 <- plot_density_diff(pt_kpmp_results$clin_var_res$weight_delta$df_binned, 
+# density difference by treatment group instead of clinical variable direction
+p5 <- plot_density_diff(pt_kpmp_results$clin_var_res$weight_delta$df_binned,
                         "Weight", "\u0394Weight",
                         direction_var = "treatment",
                         direction_vals = c("Placebo", "Dapagliflozin"),
@@ -376,7 +356,7 @@ s3$upload_file(temp_file, "attempt", paste0("slingshot/attempt_density_diff_trt_
 ```
 
 ```{r echo = F}
-# compositional pie charts of cell groups
+# compositional pie charts showing cell type proportions along pseudotime bins
 bins <- c(0, 10, 20, 30, 40)
 color_palette <- c(
   "aPT" = "#264653",
@@ -412,7 +392,7 @@ ggsave(filename = temp_file, width = 12, height = 10)
 s3$upload_file(temp_file, "attempt", file.path("slingshot", paste0("attempt_pt_slingshot_density_celltype_pie.png")))
 
 
-# compositional pie charts of treatment groups
+# compositional pie charts of treatment x visit groups along pseudotime bins
 group_by_col    <- "visit_treatment"
 caption_groups  <- c("PRE Placebo", "POST Placebo", "PRE Dapagliflozin", "POST Dapagliflozin")
 palette_used    <- visit_treatment_color_palette  # named vector
@@ -449,7 +429,7 @@ build_pie_row <- function(df, group_by = group_by_col, n_pies = n_pies_to_show) 
   pies
 }
 
-# Main loop over all clinical variables you’ve analyzed
+# loop over clinical variables to create combined pseudotime + pie chart panels
 all_outputs <- list()
 
 for (clin_var in names(pt_kpmp_results$clin_var_res)) {
@@ -487,6 +467,7 @@ pt_kpmp_results$clin_var_res$hba1c_delta$plot_visit_direction
 # PT (non-KPMP celltype)
 
 ```{r echo = F}
+# slingshot pseudotime for PT non-KPMP subtypes (PT-1 through PT-5)
 pt_results <- analyze_pseudotime_by_celltype(
   so = attempt_so,
   celltype_col = "celltype",
@@ -502,6 +483,7 @@ pt_results <- analyze_pseudotime_by_celltype(
 # TAL (KPMP celltype)
 
 ```{r echo = F}
+# slingshot pseudotime for TAL KPMP subtypes
 tal_kpmp_results <- analyze_pseudotime_by_celltype(
   so = attempt_so,
   celltype_col = "KPMP_celltype",
@@ -516,6 +498,7 @@ tal_kpmp_results <- analyze_pseudotime_by_celltype(
 # TAL + ATL (KPMP celltype)
 
 ```{r echo = F}
+# slingshot pseudotime for TAL + ATL KPMP subtypes
 tal_atl_kpmp_results <- analyze_pseudotime_by_celltype(
   so = attempt_so,
   celltype_col = "KPMP_celltype",
@@ -530,6 +513,7 @@ tal_atl_kpmp_results <- analyze_pseudotime_by_celltype(
 # TAL (non-KPMP celltype)
 
 ```{r echo = F}
+# slingshot pseudotime for TAL non-KPMP subtypes
 tal_results <- analyze_pseudotime_by_celltype(
   so = attempt_so,
   celltype_col = "celltype",
@@ -544,6 +528,7 @@ tal_results <- analyze_pseudotime_by_celltype(
 # TAL + ATL (non-KPMP celltype)
 
 ```{r echo = F}
+# slingshot pseudotime for TAL + ATL non-KPMP subtypes
 tal_atl_results <- analyze_pseudotime_by_celltype(
   so = attempt_so,
   celltype_col = "celltype",
@@ -560,6 +545,7 @@ tal_atl_results <- analyze_pseudotime_by_celltype(
 # IC (KPMP celltype)
 
 ```{r echo = F}
+# slingshot pseudotime for IC KPMP subtypes
 ic_kpmp_results <- analyze_pseudotime_by_celltype(
   so = attempt_so,
   celltype_col = "KPMP_celltype",
@@ -574,6 +560,7 @@ ic_kpmp_results <- analyze_pseudotime_by_celltype(
 # IC (non-KPMP celltype)
 
 ```{r echo = F}
+# slingshot pseudotime for IC non-KPMP subtypes
 ic_results <- analyze_pseudotime_by_celltype(
   so = attempt_so,
   celltype_col = "celltype",
@@ -588,6 +575,7 @@ ic_results <- analyze_pseudotime_by_celltype(
 # EC (KPMP celltype)
 
 ```{r echo = F}
+# slingshot pseudotime for EC KPMP subtypes
 ec_kpmp_results <- analyze_pseudotime_by_celltype(
   so = attempt_so,
   celltype_col = "KPMP_celltype",
@@ -602,6 +590,7 @@ ec_kpmp_results <- analyze_pseudotime_by_celltype(
 # EC (non-KPMP celltype)
 
 ```{r echo = F}
+# slingshot pseudotime for EC non-KPMP subtypes
 ec_results <- analyze_pseudotime_by_celltype(
   so = attempt_so,
   celltype_col = "celltype",

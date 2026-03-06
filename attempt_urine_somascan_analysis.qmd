@@ -14,6 +14,7 @@ format:
 ---
 
 ```{r echo = F, include = F}
+# load required packages
 library(jsonlite)
 library(aws.s3)
 library(dplyr)
@@ -33,38 +34,32 @@ library(openxlsx)
 library(SomaPlotr)
 library(lme4)
 library(lmerTest)
-library(fgsea)
+library(here)
 
-# specify user for paths
-user <- Sys.info()[["user"]]
+# source shared ATTEMPT analysis functions (from this repository)
+source(here("attempt_functions.R"))
 
-if (user == "choiyej") {
-  root_path <- "/Users/choiyej/Library/CloudStorage/OneDrive-SharedLibraries-UW/Laura Pyle - Bjornstad/Biostatistics Core Shared Drive/"
-  git_path <- "/Users/choiyej/GitHub/CHCO-Code/Petter Bjornstad/"
-} else if (user == "pylell") {
-  root_path <- "/Users/pylell/Library/CloudStorage/OneDrive-SharedLibraries-UW/Bjornstad/Biostatistics Core Shared Drive/"
-  git_path <- "/Users/pylell/Documents/GitHub/CHCO-Code/Petter Bjornstad/"
-} else {
-  stop("Unknown user: please specify root path for this user.")
-}
+# NOTE: correlation_function.R is available in the main CHCO-Code repository
+# source("correlation_function.R")
 
-source(file.path(git_path, "ATTEMPT/attempt_functions.R"))
-source(file.path(git_path, "Resources/YC/R Functions/correlation_function.R"))
-
-bg_path <- file.path(root_path, "GSEA/")
+# set paths for data inputs and results outputs
+# users should set these environment variables or edit paths to match local setup
+bg_path <- file.path(root_path, "GSEA")
 load(file.path(root_path, "KNIGHT/Somalogic data/analytes.Rdata"))
 
-# load urine creatinine
+# load urine creatinine sample manifest
 urine_creat <- read.xlsx(file.path(root_path, 'ATTEMPT/Data Raw/Urine Proteomics Sample Manifest Jun 25 2025.xlsx'), sheet = "Working")
 names(urine_creat) <- c("position", "record_id", "visit", "box", "creatinine_u_proteomics", "comments")
-# SOMA analytes names/info
+# load SomaScan analyte annotation metadata
 load(file.path(root_path, "Data Harmonization/Combined SomaScan/analytes_2.Rdata"))
 
 ```
 
 ```{r include = F}
-## Create an S3 client
-keys <- fromJSON("/Users/choiyej/Library/CloudStorage/OneDrive-TheUniversityofColoradoDenver/Bjornstad Pyle Lab/keys.json")
+# configure S3 connection to Kopah (UW research storage)
+# NOTE: users must provide their own keys.json with AWS credentials
+# see README for details on data access
+keys <- fromJSON(Sys.getenv("ATTEMPT_KEYS_PATH", unset = "keys.json"))
 
 Sys.setenv(
   "AWS_ACCESS_KEY_ID" = keys$MY_ACCESS_KEY,
@@ -77,7 +72,8 @@ Sys.setenv(
 
 
 ```{r echo = F}
-harm_dat_raw <- read.csv(file.path(root_path, "Data Harmonization/Data Clean/soma_harmonized_dataset.csv"), na.strings = "") 
+# load harmonized SomaScan dataset and filter to ATTEMPT study
+harm_dat_raw <- read.csv(file.path(root_path, "Data Harmonization/Data Clean/soma_harmonized_dataset.csv"), na.strings = "")
 
 attempt_redcap <- harm_dat_raw %>% filter(study == "ATTEMPT") %>%
   dplyr::summarise(across(where(negate(is.numeric)), ~ ifelse(all(is.na(.x)), NA_character_, last(na.omit(.x)))),
@@ -92,6 +88,7 @@ attempt_redcap <- harm_dat_raw %>% filter(study == "ATTEMPT") %>%
   arrange(record_id) %>%
   dplyr::select(-hba1c, -starts_with("seq."))
 
+# subset Denver site (record_id starts with 3) and recode visits to numeric weeks
 attempt_redcap_denver <- attempt_redcap %>%
   filter(grepl("^3", record_id)) %>%
   mutate(visit = case_when(visit == "baseline" ~ 0,
@@ -110,7 +107,7 @@ attempt_redcap_denver <- attempt_redcap %>%
   ungroup() %>%
   dplyr::rename(subject_id = record_id)
 
-# clinical dataset from Antoine (merged version)
+# clinical dataset from Antoine (merged version), recode visits to numeric weeks
 attempt_dat <- s3readRDS("Clinical Data/ATTEMPT_AC.RDS", "attempt", region = "")
 attempt_dat[attempt_dat == ""] <- NA
 attempt_dat <- attempt_dat %>%
@@ -137,7 +134,7 @@ attempt_biopsy_yn <- attempt_biopsy_yn %>%
           filter(visit == 0) %>%
           mutate(visit = -4))
 
-# merge REDCap version (for Denver) and dataset from Antoine
+# merge REDCap version (for Denver) and dataset from Antoine, add biopsy flag
 attempt_dat <- left_join(attempt_dat, attempt_redcap_denver) %>%
   left_join(attempt_biopsy_yn) %>%
   mutate(biopsy_yn = case_when(biopsy_yn == "Yes" ~ "Yes",
@@ -146,7 +143,7 @@ attempt_dat$treatment <- factor(attempt_dat$treatment, levels = c("Placebo", "Da
 ```
 
 ```{r echo = F}
-# Read SOMA
+# collapse SOMA data to one row per subject-visit, keep only baseline and 4-month
 harm_dat <- harm_dat_raw %>%
   filter(study == "ATTEMPT") %>%
   dplyr::summarise(across(where(negate(is.numeric)), ~ ifelse(all(is.na(.x)), NA_character_, last(na.omit(.x)))),
@@ -162,48 +159,27 @@ harm_dat <- harm_dat_raw %>%
                                    T ~ "Dapagliflozin")) %>%
   filter(visit %in% c(0, 16))
 
-# load urine SOMA and normalize by creatinine
+# filter to samples with urine SOMA data, exclude very low creatinine (likely serum mix-up)
 soma <- harm_dat %>%
   filter(!is.na(seq.10030.8_urine)) %>%
-  filter(urine_creat_proteomics > 1) # filtering out those with extremely low creatinine (mix up with serum)
+  filter(urine_creat_proteomics > 1)
 
 soma$visit <- factor(soma$visit, levels = c(0, 16), label = c("PRE", "POST"))
-
-# # N's for consort diagram
-# soma_bl <- subset(harm_dat, visit == 0) %>%
-#   filter(urine_creat_proteomics > 1 |
-#            is.na(urine_creat_proteomics))
-# table(soma_bl$treatment, !is.na(soma_bl$seq.10030.8))
-# table(soma_bl$treatment, !is.na(soma_bl$seq.10030.8_urine))
-# 
-# soma_bl_den <- subset(soma_bl) %>%
-#   filter(record_id > 30000)
-# table(soma_bl_den$treatment, !is.na(soma_bl_den$seq.10030.8))
-# table(soma_bl_den$treatment, !is.na(soma_bl_den$seq.10030.8_urine))
-# 
-# soma_fu <- subset(harm_dat, visit == 16) %>%
-#   filter(urine_creat_proteomics > 1 |
-#            is.na(urine_creat_proteomics))
-# table(soma_fu$treatment, !is.na(soma_fu$seq.10030.8))
-# table(soma_fu$treatment, !is.na(soma_fu$seq.10030.8_urine))
-# 
-# soma_fu_den <- subset(soma_fu) %>%
-#   filter(record_id > 30000)
-# table(soma_fu_den$treatment, !is.na(soma_fu_den$seq.10030.8))
-# table(soma_fu_den$treatment, !is.na(soma_fu_den$seq.10030.8_urine))
 ```
 
 # SOMA
 
 ```{r echo = F, results='asis'}
-summary(arsenal::tableby(visit ~ age + sex + bmi + diabetes_duration, 
-                         data = soma, strata = treatment_arm), test = F, 
-        labelTranslations = c("age" = "Age", "sex" = "Sex", "acr_u" = "UACR", 
+# demographics table stratified by treatment arm and visit
+summary(arsenal::tableby(visit ~ age + sex + bmi + diabetes_duration,
+                         data = soma, strata = treatment_arm), test = F,
+        labelTranslations = c("age" = "Age", "sex" = "Sex", "acr_u" = "UACR",
                               "bmi" = "BMI", "diabetes_duration" = "Diabetes duration"))
 ```
 
 ## Placebo
 ```{r echo = F}
+# fit limma within-treatment model for placebo (PRE vs POST)
 placebo_res_urine <- run_limma_proteomics(data = soma,
                                           analyte_info = analytes_attempt,
                                           treatment = "Placebo",
@@ -212,6 +188,7 @@ placebo_res_urine <- run_limma_proteomics(data = soma,
 ```
 
 ```{r echo = F}
+# volcano plots for placebo within-treatment results (raw and adj p-values)
 plot_volcano_proteomics(data = placebo_res_urine$results_annotated, fc = "logFC",
                         p_col = "P.Value",
                         title = NULL,
@@ -234,6 +211,7 @@ plot_volcano_proteomics(data = placebo_res_urine$results_annotated, fc = "logFC"
 
 ## Dapagliflozin
 ```{r echo = F}
+# fit limma within-treatment model for dapagliflozin (PRE vs POST)
 dapa_res_urine <- run_limma_proteomics(data = soma,
                                        analyte_info = analytes_attempt,
                                        treatment = "Dapagliflozin",
@@ -242,6 +220,7 @@ dapa_res_urine <- run_limma_proteomics(data = soma,
 ```
 
 ```{r echo = F}
+# volcano plots for dapagliflozin within-treatment results (raw and adj p-values)
 plot_volcano_proteomics(data = dapa_res_urine$results_annotated, fc = "logFC",
                         p_col = "P.Value",
                         title = NULL,
@@ -264,6 +243,7 @@ plot_volcano_proteomics(data = dapa_res_urine$results_annotated, fc = "logFC",
 
 ## PRE (Placebo vs. Dapa)
 ```{r echo = F}
+# fit limma within-visit model at baseline (placebo vs dapa)
 pre_res_urine <- run_limma_proteomics(data = soma,
                                       analyte_info = analytes_attempt,
                                       visit = "PRE",
@@ -272,6 +252,7 @@ pre_res_urine <- run_limma_proteomics(data = soma,
 ```
 
 ```{r echo = F}
+# volcano plots for baseline treatment comparison (raw and adj p-values)
 plot_volcano_proteomics(data = pre_res_urine$results_annotated, fc = "logFC",
                         p_col = "P.Value",
                         title = NULL,
@@ -294,6 +275,7 @@ plot_volcano_proteomics(data = pre_res_urine$results_annotated, fc = "logFC",
 
 ## POST (Placebo vs. Dapa)
 ```{r echo = F}
+# fit limma within-visit model at follow-up (placebo vs dapa)
 post_res_urine <- run_limma_proteomics(data = soma,
                                        analyte_info = analytes_attempt,
                                        visit = "POST",
@@ -302,10 +284,11 @@ post_res_urine <- run_limma_proteomics(data = soma,
 ```
 
 ```{r echo = F}
+# volcano plots for follow-up treatment comparison (raw and adj p-values)
 plot_volcano_proteomics(data = post_res_urine$results_annotated, fc = "logFC",
                         p_col = "P.Value",
                         title = NULL,
-                        x_axis = "LogFC", 
+                        x_axis = "LogFC",
                         y_axis = "-log10(p-value)",
                         positive_text = "Positive in dapagliflozin\ncompared to placebo (at follow-up)",
                         negative_text = "Negative in dapagliflozin\ncompared to placebo (at follow-up)",
@@ -331,6 +314,7 @@ did_res_urine <- run_limma_proteomics(data = soma,
                                       feature_suffix = "_urine_cradj",
                                       model_type = "interaction")
 
+# fit DiD mixed model with random intercept for subject
 did_res_urine_mixed <- run_limma_proteomics(data = soma,
                                             analyte_info = analytes_attempt,
                                             feature_suffix = "_urine_cradj",
@@ -338,33 +322,12 @@ did_res_urine_mixed <- run_limma_proteomics(data = soma,
 # 6 out of 7289 singularity warning (0.1%)
 
 s3saveRDS(did_res_urine_mixed, "Proteomics/urine_cradj_proteomics_res.RDS", "attempt", region = "")
-write.csv(did_res_urine_mixed$results_annotated, file.path(root_path, "ATTEMPT/Results/Somascan/urine_cradj_proteomics_res.csv"), row.names = F)
+write.csv(did_res_urine_mixed$results_annotated, file.path(results_dir, "Somascan/urine_cradj_proteomics_res.csv"), row.names = F)
 ```
 
 ```{r echo = F}
+# load saved DiD mixed model results and create volcano plots
 did_res_urine_mixed <- s3readRDS("Proteomics/urine_cradj_proteomics_res.RDS", "attempt", region = "")
-
-# plot_volcano_proteomics(data = did_res_urine$results_annotated, 
-#                         fc = "logFC",
-#                         p_col = "P.Value",
-#                         title = NULL,
-#                         x_axis = "LogFC", 
-#                         y_axis = "-log10(p-value)",
-#                         positive_text = "Positive with Dapagliflozin",
-#                         negative_text = "Negative with Dapagliflozin",
-#                         formula = "treatment:visit",
-#                         file_suffix = "_DiD_urine_proteomics")
-# 
-# plot_volcano_proteomics(data = did_res_urine$results_annotated, 
-#                         fc = "logFC",
-#                         p_col = "adj.P.Val",
-#                         title = NULL,
-#                         x_axis = "LogFC", 
-#                         y_axis = "-log10(adj.p-value)",
-#                         positive_text = "Positive with Dapagliflozin",
-#                         negative_text = "Negative with Dapagliflozin",
-#                         formula = "treatment:visit",
-#                         file_suffix = "_DiD_urine_proteomics_adjp")
 
 plot_volcano_proteomics(data = did_res_urine_mixed$results_annotated, 
                         fc = "logFC",
@@ -390,7 +353,7 @@ urine_volcano <- plot_volcano_proteomics(data = did_res_urine_mixed$results_anno
 ```
 
 ```{r echo = F}
-# DiD heatmap
+# pivot DiD results wide for heatmap, filter to FDR < 0.05
 res_full_wide <- did_res_urine_mixed$results_full %>%
   dplyr::select(-effect) %>%
   # Pivot wider, creating columns for each term's statistics
@@ -404,6 +367,7 @@ res_full_wide <- did_res_urine_mixed$results_full %>%
          Gene_seq = paste0(EntrezGeneSymbol, " (", SeqId, ")")) %>%
   filter(`treatment_armDapagliflozin:visitPOST_adj.P.Val` < 0.05)
 
+# heatmap of top 20 significant DiD proteins
 urine_heatmap <- plot_treatment_heatmap(data = res_full_wide,
                        p_col = "P.Value",
                        top_n = 20,
@@ -413,14 +377,16 @@ urine_heatmap <- plot_treatment_heatmap(data = res_full_wide,
                        gene_col = "Gene_seq",
                        heatmap_caption = F)
 
+# combine volcano and heatmap into panel figure
 ggarrange(urine_volcano, urine_heatmap, widths = c(2,1), labels = "AUTO", hjust = c(0,0.5))
-ggsave(file.path(root_path, "ATTEMPT/Results/Figures/Panels/urine_proteomics_panel.png"), width = 10, height = 6)
+ggsave(file.path(results_dir, "Figures/Panels/urine_proteomics_panel.png"), width = 10, height = 6)
 
 ```
 
 ## GSEA (fgsea)
 
 ```{r echo = F}
+# run GSEA pathway analysis on creatinine-adjusted DiD results
 soma_DiD_fgsea <- run_fgsea_analysis(bg_path = bg_path,
                                      results_annotated = did_res_urine_mixed$results_annotated,
                                      stat_col = "statistic")
@@ -428,23 +394,24 @@ soma_DiD_fgsea$summary
 ```
 
 ```{r echo = F}
+# plot top 30 enriched pathways for KEGG, REACTOME, and GO
 # KEGG
-plot_fgsea_transpose(soma_DiD_fgsea$kegg, 
+plot_fgsea_transpose(soma_DiD_fgsea$kegg,
                      title = "SOMA DiD Top 30 KEGG",
                      xmax = 30)
-ggsave(file.path(root_path, "ATTEMPT/Results/Figures/Proteomics/Pathways/urine_SOMA_DiD_KEGG.png"),
+ggsave(file.path(results_dir, "Figures/Proteomics/Pathways/urine_SOMA_DiD_KEGG.png"),
        width = 27.5, height = 14, scale = 1)
 # REACTOME
-plot_fgsea_transpose(soma_DiD_fgsea$reactome, 
-                     title = "SOMA DiD Top 30 REACTOME", 
+plot_fgsea_transpose(soma_DiD_fgsea$reactome,
+                     title = "SOMA DiD Top 30 REACTOME",
                      xmax = 30)
-ggsave(file.path(root_path, "ATTEMPT/Results/Figures/Proteomics/Pathways/urine_SOMA_DiD_REACTOME.png"),
+ggsave(file.path(results_dir, "Figures/Proteomics/Pathways/urine_SOMA_DiD_REACTOME.png"),
        width = 27.5, height = 14, scale = 1)
 # GO
-plot_fgsea_transpose(soma_DiD_fgsea$go, 
-                     title = "SOMA DiD Top 30 GO", 
+plot_fgsea_transpose(soma_DiD_fgsea$go,
+                     title = "SOMA DiD Top 30 GO",
                      xmax = 30)
-ggsave(file.path(root_path, "ATTEMPT/Results/Figures/Proteomics/Pathways/urine_SOMA_DiD_GO.png"),
+ggsave(file.path(results_dir, "Figures/Proteomics/Pathways/urine_SOMA_DiD_GO.png"),
        width = 27.5, height = 14, scale = 1)
 ```
 
@@ -455,11 +422,10 @@ ggsave(file.path(root_path, "ATTEMPT/Results/Figures/Proteomics/Pathways/urine_S
 # read in results from transcriptomics (PT, TAL, DCT, CD (collecting duct = PC, IC), and POD for urine proteimics)
 celltypes <- c("PT", "TAL", "PC", "IC", "POD")
 
-# Full gene set (not limited to 2000 HVG)
+# load and process nebula DiD results for each cell type (full gene set)
 for (cell in celltypes)  {
   input_path <- paste0(cell,"/nebula/",tolower(cell),"_attempt_nebula_res_reml_pooled.rds")
   cell_df <- s3readRDS(input_path, bucket = "attempt", region = "")
-  head(cell_df)
   processed <- process_nebula_results(cell_df)
   lower_cell <- tolower(cell)
   var_name <- paste0(lower_cell, "_nebula_res_combined_reml_pooled")
@@ -467,9 +433,11 @@ for (cell in celltypes)  {
   assign(var_name, processed$results)
 }
 
+# filter to nominally significant DiD proteins
 urine_did_sig <- did_res_urine_mixed$results_annotated %>%
   filter(P.Value < 0.05)
 
+# compute PRE-to-POST delta for each protein per subject
 urine_delta <- soma %>%
   dplyr::select(record_id, visit, treatment_arm, starts_with("seq") & ends_with("cradj")) %>%
   pivot_wider(
@@ -486,7 +454,7 @@ s3saveRDS(urine_delta, "Proteomics/urine_cradj_proteomics_delta.RDS", "attempt",
 ```
 
 ```{r echo = F}
-# create mapping table for each celltype
+# map overlapping significant genes between scRNA DiD and urine protein DiD per cell type
 walk(celltypes, function(ct) {
   
   # Dynamically get the nebula results object based on cell type
@@ -500,7 +468,7 @@ walk(celltypes, function(ct) {
     dplyr::select(Target, TargetFullName, AptName, EntrezGeneSymbol)
   
   write.csv(map, 
-            file.path(root_path, paste0("ATTEMPT/Results/Somascan/", ct, "_urine_proteomics_map.csv")), 
+            file.path(results_dir, "Somascan", paste0(ct, "_urine_proteomics_map.csv")),
             row.names = FALSE, na = "")
 })
 ```
@@ -511,7 +479,7 @@ walk(celltypes, function(ct) {
 ### mGFR
 
 ```{r echo = F, warning=FALSE, quiet = TRUE}
-# mGFR 
+# correlate delta urine proteins with delta mGFR (labeled by target name)
 urine_soma_mgfr <- soma_corr(
   clinical_raw = attempt_dat,
   soma_raw     = soma,
@@ -529,10 +497,10 @@ urine_soma_mgfr$correlation_table
 
 # plots
 urine_soma_mgfr$plot_all
-ggsave(file.path(root_path, "ATTEMPT/Results/Figures/Proteomics/Volcano Plots/Correlations/volcano_mixed_spearman_urine_mgfr.png"),
+ggsave(file.path(results_dir, "Figures/Proteomics/Volcano Plots/Correlations/volcano_mixed_spearman_urine_mgfr.png"),
        urine_soma_mgfr$plot_all, width = 10, height = 7)
 
-# mGFR 
+# same mGFR correlation but labeled by gene symbol
 urine_soma_mgfr_gene <- soma_corr(
   clinical_raw = attempt_dat,
   soma_raw     = soma,
@@ -550,13 +518,14 @@ urine_soma_mgfr_gene$correlation_table
 
 # plots
 urine_soma_mgfr_gene$plot_all
-ggsave(file.path(root_path, "ATTEMPT/Results/Figures/Proteomics/Volcano Plots/Correlations/volcano_mixed_spearman_urine_mgfr_gene.png"),
+ggsave(file.path(results_dir, "Figures/Proteomics/Volcano Plots/Correlations/volcano_mixed_spearman_urine_mgfr_gene.png"),
        urine_soma_mgfr_gene$plot_all, width = 10, height = 7)
 ```
 
 ### mGFR adjusted
 
 ```{r echo = F, warning=FALSE}
+# correlate delta urine proteins with delta BSA-adjusted mGFR
 urine_soma_mgfr_adj <- soma_corr(
   clinical_raw = attempt_dat,
   soma_raw     = soma,
@@ -573,13 +542,14 @@ urine_soma_mgfr_adj$correlation_table
 
 # plots
 urine_soma_mgfr_adj$plot_all
-ggsave(file.path(root_path, "ATTEMPT/Results/Figures/Proteomics/Volcano Plots/Correlations/volcano_mixed_spearman_urine_mgfr_bsa.png"),
+ggsave(file.path(results_dir, "Figures/Proteomics/Volcano Plots/Correlations/volcano_mixed_spearman_urine_mgfr_bsa.png"),
        urine_soma_mgfr_adj$plot_all, width = 10, height = 7)
 ```
 
 ### HbA1c
 
 ```{r echo = F, warning=FALSE}
+# correlate delta urine proteins with delta HbA1c
 urine_soma_hba1c <- soma_corr(
   clinical_raw = attempt_dat,
   soma_raw     = soma,
@@ -595,13 +565,14 @@ urine_soma_hba1c$correlation_table
 
 # plots
 urine_soma_hba1c$plot_all
-ggsave(file.path(root_path, "ATTEMPT/Results/Figures/Proteomics/Volcano Plots/Correlations/volcano_mixed_spearman_urine_hba1c.png"),
+ggsave(file.path(results_dir, "Figures/Proteomics/Volcano Plots/Correlations/volcano_mixed_spearman_urine_hba1c.png"),
        urine_soma_hba1c$plot_all, width = 10, height = 7)
 ```
 
 ### TIR
 
 ```{r echo = F, warning=FALSE}
+# correlate delta urine proteins with delta time in range
 urine_soma_tir <- soma_corr(
   clinical_raw = attempt_dat,
   soma_raw     = soma,
@@ -617,13 +588,14 @@ urine_soma_tir$correlation_table
 
 # plots
 urine_soma_tir$plot_all
-ggsave(file.path(root_path, "ATTEMPT/Results/Figures/Proteomics/Volcano Plots/Correlations/volcano_mixed_spearman_urine_tir.png"),
+ggsave(file.path(results_dir, "Figures/Proteomics/Volcano Plots/Correlations/volcano_mixed_spearman_urine_tir.png"),
        urine_soma_tir$plot_all, width = 10, height = 7)
 ```
 
 ### Weight
 
 ```{r echo = F, warning=FALSE}
+# correlate delta urine proteins with delta weight
 urine_soma_weight <- soma_corr(
   clinical_raw = attempt_dat,
   soma_raw     = soma,
@@ -639,13 +611,14 @@ urine_soma_weight$correlation_table
 
 # plots
 urine_soma_weight$plot_all
-ggsave(file.path(root_path, "ATTEMPT/Results/Figures/Proteomics/Volcano Plots/Correlations/volcano_mixed_spearman_urine_weight.png"),
+ggsave(file.path(results_dir, "Figures/Proteomics/Volcano Plots/Correlations/volcano_mixed_spearman_urine_weight.png"),
        urine_soma_weight$plot_all, width = 10, height = 7)
 ```
 
 ### PWV
 
 ```{r echo = F, warning=FALSE}
+# correlate delta urine proteins with delta pulse wave velocity
 urine_soma_PWV <- soma_corr(
   clinical_raw = attempt_dat,
   soma_raw     = soma,
@@ -662,13 +635,14 @@ urine_soma_PWV$correlation_table
 
 # plots
 urine_soma_PWV$plot_all
-ggsave(file.path(root_path, "ATTEMPT/Results/Figures/Proteomics/Volcano Plots/Correlations/volcano_mixed_spearman_urine_PWV.png"),
+ggsave(file.path(results_dir, "Figures/Proteomics/Volcano Plots/Correlations/volcano_mixed_spearman_urine_PWV.png"),
        urine_soma_PWV$plot_all, width = 10, height = 7)
 ```
 
 ### Cortical R2*
 
 ```{r echo = F, warning=FALSE}
+# correlate delta urine proteins with delta cortical R2* (BOLD MRI oxygenation)
 urine_soma_avg_c_r2 <- soma_corr(
   clinical_raw = attempt_dat,
   soma_raw     = soma,
@@ -685,13 +659,14 @@ urine_soma_avg_c_r2$correlation_table
 
 # plots
 urine_soma_avg_c_r2$plot_all
-ggsave(file.path(root_path, "ATTEMPT/Results/Figures/Proteomics/Volcano Plots/Correlations/volcano_mixed_spearman_urine_avg_c_r2.png"),
+ggsave(file.path(results_dir, "Figures/Proteomics/Volcano Plots/Correlations/volcano_mixed_spearman_urine_avg_c_r2.png"),
        urine_soma_avg_c_r2$plot_all, width = 10, height = 7)
 ```
 
 ### Kidney R2*
 
 ```{r echo = F, warning=FALSE}
+# correlate delta urine proteins with delta kidney R2* (BOLD MRI oxygenation)
 urine_soma_avg_k_r2 <- soma_corr(
   clinical_raw = attempt_dat,
   soma_raw     = soma,
@@ -708,35 +683,21 @@ urine_soma_avg_k_r2$correlation_table
 
 # plots
 urine_soma_avg_k_r2$plot_all
-ggsave(file.path(root_path, "ATTEMPT/Results/Figures/Proteomics/Volcano Plots/Correlations/volcano_mixed_spearman_urine_avg_k_r2.png"),
+ggsave(file.path(results_dir, "Figures/Proteomics/Volcano Plots/Correlations/volcano_mixed_spearman_urine_avg_k_r2.png"),
        urine_soma_avg_k_r2$plot_all, width = 10, height = 7)
-```
-
-```{r echo = F}
-# # write correlation results to file
-# wb <- createWorkbook()
-# addWorksheet(wb,"Change in mgfr_si")
-# writeData(wb,"Change in mgfr_si",corr_delta_mgfr_si_mat,rowNames = F)
-# addWorksheet(wb,"Change in mgfr_si_adjusted")
-# writeData(wb,"Change in mgfr_si_adjusted",corr_delta_mgfr_si_adjusted_mat,rowNames = F)
-# addWorksheet(wb,"Change in HbA1c")
-# writeData(wb,"Change in HbA1c",corr_delta_hba1c_percent_mat,rowNames = F)
-# addWorksheet(wb,"Change in PWV")
-# writeData(wb,"Change in PWV",corr_delta_PWV_mat,rowNames = F)
-# 
-# saveWorkbook(wb,file.path(root_path, "ATTEMPT/Results/Somascan/Somascan_clinical_correlations.xlsx"),overwrite = TRUE)
 ```
 
 # DiD (Creatinine in model)
 
 ```{r echo = F}
-# using creatinine in the model
+# fit DiD fixed-effect model with creatinine as covariate (not pre-normalized)
 did_res_urine_cr <- run_limma_proteomics(data = soma,
                                          analyte_info = analytes_attempt,
                                          feature_suffix = "_urine",
                                          creatinine = "urine_creat_proteomics",
                                          model_type = "interaction")
 
+# fit DiD mixed model with creatinine as covariate and random subject intercept
 did_res_urine_mixed_cr <- run_limma_proteomics(data = soma,
                                                analyte_info = analytes_attempt,
                                                feature_suffix = "_urine",
@@ -746,11 +707,12 @@ did_res_urine_mixed_cr <- run_limma_proteomics(data = soma,
 ```
 
 ```{r echo = F}
-plot_volcano_proteomics(data = did_res_urine_cr$results_annotated, 
+# volcano plots for DiD with creatinine-in-model (fixed and mixed, raw and adj p)
+plot_volcano_proteomics(data = did_res_urine_cr$results_annotated,
                         fc = "logFC",
                         p_col = "P.Value",
                         title = NULL,
-                        x_axis = "LogFC", 
+                        x_axis = "LogFC",
                         y_axis = "-log10(p-value)",
                         positive_text = "Positive DiD",
                         negative_text = "Negative DiD",
@@ -794,6 +756,7 @@ plot_volcano_proteomics(data = did_res_urine_mixed_cr$results_annotated,
 ## GSEA (fgsea)
 
 ```{r echo = F}
+# run GSEA pathway analysis on creatinine-in-model DiD results
 soma_DiD_fgsea <- run_fgsea_analysis(bg_path = bg_path,
                                      results_annotated = did_res_urine_mixed_cr$results_annotated,
                                      stat_col = "statistic")
@@ -801,23 +764,24 @@ soma_DiD_fgsea$summary
 ```
 
 ```{r echo = F}
+# plot top 30 enriched pathways for KEGG, REACTOME, and GO (creatinine-in-model)
 # KEGG
-plot_fgsea_transpose(soma_DiD_fgsea$kegg, 
+plot_fgsea_transpose(soma_DiD_fgsea$kegg,
                      title = "SOMA DiD Top 30 KEGG",
                      xmax = 30)
-ggsave(file.path(root_path, "ATTEMPT/Results/Figures/Proteomics/Pathways/urine_creatinine_SOMA_DiD_KEGG.png"),
+ggsave(file.path(results_dir, "Figures/Proteomics/Pathways/urine_creatinine_SOMA_DiD_KEGG.png"),
        width = 27.5, height = 14, scale = 1)
 # REACTOME
 plot_fgsea_transpose(soma_DiD_fgsea$reactome, 
                      title = "SOMA DiD Top 30 REACTOME", 
                      xmax = 30)
-ggsave(file.path(root_path, "ATTEMPT/Results/Figures/Proteomics/Pathways/urine_creatinine_SOMA_DiD_REACTOME.png"),
+ggsave(file.path(results_dir, "Figures/Proteomics/Pathways/urine_creatinine_SOMA_DiD_REACTOME.png"),
        width = 27.5, height = 14, scale = 1)
 # GO
 plot_fgsea_transpose(soma_DiD_fgsea$go, 
                      title = "SOMA DiD Top 30 GO", 
                      xmax = 30)
-ggsave(file.path(root_path, "ATTEMPT/Results/Figures/Proteomics/Pathways/urine_creatinine_SOMA_DiD_GO.png"),
+ggsave(file.path(results_dir, "Figures/Proteomics/Pathways/urine_creatinine_SOMA_DiD_GO.png"),
        width = 27.5, height = 14, scale = 1)
 ```
 
@@ -826,7 +790,7 @@ ggsave(file.path(root_path, "ATTEMPT/Results/Figures/Proteomics/Pathways/urine_c
 ### mGFR
 
 ```{r echo = F, warning=FALSE, quiet = TRUE}
-# mGFR 
+# correlate creatinine-in-model DiD proteins with delta mGFR
 urine_soma_mgfr <- soma_corr(
   clinical_raw = attempt_dat,
   soma_raw     = soma,
@@ -843,13 +807,14 @@ urine_soma_mgfr$correlation_table
 
 # plots
 urine_soma_mgfr$plot_all
-ggsave(file.path(root_path, "ATTEMPT/Results/Figures/Proteomics/Volcano Plots/Correlations/volcano_mixed_cr_spearman_urine_mgfr.png"),
+ggsave(file.path(results_dir, "Figures/Proteomics/Volcano Plots/Correlations/volcano_mixed_cr_spearman_urine_mgfr.png"),
        urine_soma_mgfr$plot_all, width = 10, height = 7)
 ```
 
 ### mGFR adjusted
 
 ```{r echo = F, warning=FALSE}
+# correlate creatinine-in-model DiD proteins with delta BSA-adjusted mGFR
 urine_soma_mgfr_adj <- soma_corr(
   clinical_raw = attempt_dat,
   soma_raw     = soma,
@@ -866,13 +831,14 @@ urine_soma_mgfr_adj$correlation_table
 
 # plots
 urine_soma_mgfr_adj$plot_all
-ggsave(file.path(root_path, "ATTEMPT/Results/Figures/Proteomics/Volcano Plots/Correlations/volcano_mixed_cr_spearman_urine_mgfr_bsa.png"),
+ggsave(file.path(results_dir, "Figures/Proteomics/Volcano Plots/Correlations/volcano_mixed_cr_spearman_urine_mgfr_bsa.png"),
        urine_soma_mgfr_adj$plot_all, width = 10, height = 7)
 ```
 
 ### HbA1c
 
 ```{r echo = F, warning=FALSE}
+# correlate creatinine-in-model DiD proteins with delta HbA1c
 urine_soma_hba1c <- soma_corr(
   clinical_raw = attempt_dat,
   soma_raw     = soma,
@@ -888,12 +854,13 @@ urine_soma_hba1c$correlation_table
 
 # plots
 urine_soma_hba1c$plot_all
-ggsave(file.path(root_path, "ATTEMPT/Results/Figures/Proteomics/Volcano Plots/Correlations/volcano_mixed_cr_spearman_urine_hba1c.png"),
+ggsave(file.path(results_dir, "Figures/Proteomics/Volcano Plots/Correlations/volcano_mixed_cr_spearman_urine_hba1c.png"),
        urine_soma_hba1c$plot_all, width = 10, height = 7)
 ```
 ### TIR
 
 ```{r echo = F, warning=FALSE}
+# correlate creatinine-in-model DiD proteins with delta time in range
 urine_soma_tir <- soma_corr(
   clinical_raw = attempt_dat,
   soma_raw     = soma,
@@ -909,13 +876,14 @@ urine_soma_tir$correlation_table
 
 # plots
 urine_soma_tir$plot_all
-ggsave(file.path(root_path, "ATTEMPT/Results/Figures/Proteomics/Volcano Plots/Correlations/volcano_mixed_cr_spearman_urine_tir.png"),
+ggsave(file.path(results_dir, "Figures/Proteomics/Volcano Plots/Correlations/volcano_mixed_cr_spearman_urine_tir.png"),
        urine_soma_tir$plot_all, width = 10, height = 7)
 ```
 
 ### Weight
 
 ```{r echo = F, warning=FALSE}
+# correlate creatinine-in-model DiD proteins with delta weight
 urine_soma_weight <- soma_corr(
   clinical_raw = attempt_dat,
   soma_raw     = soma,
@@ -931,13 +899,14 @@ urine_soma_weight$correlation_table
 
 # plots
 urine_soma_weight$plot_all
-ggsave(file.path(root_path, "ATTEMPT/Results/Figures/Proteomics/Volcano Plots/Correlations/volcano_mixed_cr_spearman_urine_weight.png"),
+ggsave(file.path(results_dir, "Figures/Proteomics/Volcano Plots/Correlations/volcano_mixed_cr_spearman_urine_weight.png"),
        urine_soma_weight$plot_all, width = 10, height = 7)
 ```
 
 ### PWV
 
 ```{r echo = F, warning=FALSE}
+# correlate creatinine-in-model DiD proteins with delta PWV
 urine_soma_PWV <- soma_corr(
   clinical_raw = attempt_dat,
   soma_raw     = soma,
@@ -954,13 +923,14 @@ urine_soma_PWV$correlation_table
 
 # plots
 urine_soma_PWV$plot_all
-ggsave(file.path(root_path, "ATTEMPT/Results/Figures/Proteomics/Volcano Plots/Correlations/volcano_mixed_cr_spearman_urine_PWV.png"),
+ggsave(file.path(results_dir, "Figures/Proteomics/Volcano Plots/Correlations/volcano_mixed_cr_spearman_urine_PWV.png"),
        urine_soma_PWV$plot_all, width = 10, height = 7)
 ```
 
 ### Cortical R2*
 
 ```{r echo = F, warning=FALSE}
+# correlate creatinine-in-model DiD proteins with delta cortical R2*
 urine_soma_avg_c_r2 <- soma_corr(
   clinical_raw = attempt_dat,
   soma_raw     = soma,
@@ -977,13 +947,14 @@ urine_soma_avg_c_r2$correlation_table
 
 # plots
 urine_soma_avg_c_r2$plot_all
-ggsave(file.path(root_path, "ATTEMPT/Results/Figures/Proteomics/Volcano Plots/Correlations/volcano_mixed_cr_spearman_urine_avg_c_r2.png"),
+ggsave(file.path(results_dir, "Figures/Proteomics/Volcano Plots/Correlations/volcano_mixed_cr_spearman_urine_avg_c_r2.png"),
        urine_soma_avg_c_r2$plot_all, width = 10, height = 7)
 ```
 
 ### Kidney R2*
 
 ```{r echo = F, warning=FALSE}
+# correlate creatinine-in-model DiD proteins with delta kidney R2*
 urine_soma_avg_k_r2 <- soma_corr(
   clinical_raw = attempt_dat,
   soma_raw     = soma,
@@ -1000,28 +971,14 @@ urine_soma_avg_k_r2$correlation_table
 
 # plots
 urine_soma_avg_k_r2$plot_all
-ggsave(file.path(root_path, "ATTEMPT/Results/Figures/Proteomics/Volcano Plots/Correlations/volcano_mixed_cr_spearman_urine_avg_k_r2.png"),
+ggsave(file.path(results_dir, "Figures/Proteomics/Volcano Plots/Correlations/volcano_mixed_cr_spearman_urine_avg_k_r2.png"),
        urine_soma_avg_k_r2$plot_all, width = 10, height = 7)
-```
-
-```{r echo = F}
-# # write correlation results to file
-# wb <- createWorkbook()
-# addWorksheet(wb,"Change in mgfr_si")
-# writeData(wb,"Change in mgfr_si",corr_delta_mgfr_si_mat,rowNames = F)
-# addWorksheet(wb,"Change in mgfr_si_adjusted")
-# writeData(wb,"Change in mgfr_si_adjusted",corr_delta_mgfr_si_adjusted_mat,rowNames = F)
-# addWorksheet(wb,"Change in HbA1c")
-# writeData(wb,"Change in HbA1c",corr_delta_hba1c_percent_mat,rowNames = F)
-# addWorksheet(wb,"Change in PWV")
-# writeData(wb,"Change in PWV",corr_delta_PWV_mat,rowNames = F)
-# 
-# saveWorkbook(wb,file.path(root_path, "ATTEMPT/Results/Somascan/Somascan_clinical_correlations.xlsx"),overwrite = TRUE)
 ```
 
 # Integration with scRNA (results from Hyak)
 
 ```{r include = F}
+# define cell type groupings for pseudobulk scRNA analysis
 celltype_groups <- list(
   PT = c("PT-S1/S2", "PT-S3", "aPT"),
   TAL = c("C-TAL-1", "C-TAL-2", "aTAL", "dTAL"),
@@ -1045,73 +1002,61 @@ celltype_groups$Combined_u <- c(
   celltype_groups$POD
 )
 
-## read mixed model results dataframe (rendered in Hyak)
-# process and read all results from ATTEMPT
-# Top 2000 HVG
+# read nebula mixed model results from Hyak for grouped cell types (full gene set)
 for (cell in names(celltype_groups))  {
-  print(paste0("Processing: ", cell))
   cell <- gsub("/", "_", cell)
 
-  # annotated_df <- read.csv(file.path(root_path, "ATTEMPT/Results/nebula", paste0(tolower(cell), "_kpmp_hvg_res.csv")))
-  # colnames(annotated_df) <- gsub("\\.", ":", colnames(annotated_df))
-  # cell <- gsub("-", "_", cell)
-  # cell <- gsub("\\+\\s", "_", cell)
-  # lower_cell <- tolower(cell)
-  # var_name <- paste0(lower_cell, "_hvg_kpmp")
-  # print(var_name)
-  # assign(var_name, annotated_df)
-  
-    
-  annotated_df <- read.csv(file.path(root_path, "ATTEMPT/Results/nebula", paste0(tolower(cell), "_kpmp_res.csv")))
+  annotated_df <- read.csv(file.path(results_dir, "nebula", paste0(tolower(cell), "_kpmp_res.csv")))
   colnames(annotated_df) <- gsub("\\.", ":", colnames(annotated_df))
   cell <- gsub("-", "_", cell)
   cell <- gsub("\\+\\s", "_", cell)
   lower_cell <- tolower(cell)
   var_name <- paste0(lower_cell, "_kpmp")
-  print(var_name)
   assign(var_name, annotated_df)
 }
 
+# read nebula results for individual sub-celltypes (top 2000 HVG)
 for (cell in unlist(celltype_groups))  {
-  print(paste0("Processing: ", cell))
   cell <- gsub("/", "_", cell)
   cell <- gsub("-", "_", cell)
   cell <- gsub("\\+\\s", "_", cell)
-  
-  annotated_df <- read.csv(file.path(root_path, "ATTEMPT/Results/nebula", paste0(tolower(cell), "_kpmp_hvg_res.csv")))
+
+  annotated_df <- read.csv(file.path(results_dir, "nebula", paste0(tolower(cell), "_kpmp_hvg_res.csv")))
   colnames(annotated_df) <- gsub("\\.", ":", colnames(annotated_df))
   cell <- gsub("-", "_", cell)
   cell <- gsub("\\+\\s", "_", cell)
   lower_cell <- tolower(cell)
   var_name <- paste0(lower_cell, "_hvg_kpmp")
-  print(var_name)
   assign(var_name, annotated_df)
-
 }
 ```
 
 
 ```{r echo = F}
-# nebula results (looking at associations between transcript/protein)
+# load PT transcript-protein association results from nebula
 pt_urine_raw <- s3readRDS("Proteomics/pt_nebula_urine_soma_res_kpmp.rds", "attempt", region = "")
 pt_urine <- process_nebula_results(pt_urine_raw$results, pval_col = "p_log2(protein)")$results
 pt_urine <- pt_urine %>%
   mutate(Gene = sub("_.*", "", Gene))
+# genes with significant transcript-protein association
 pt_urine_genes <- pt_urine %>%
   filter(`p_log2(protein)` < 0.05) %>%
   pull(Gene)
 
-# urine DiD results
+# reload urine DiD results for merging
 did_res_urine_mixed <- s3readRDS("Proteomics/urine_cradj_proteomics_res.RDS", "attempt", region = "")
 
+# get urine protein DiD logFC for genes with significant transcript-protein association
 did_urine_pt <- did_res_urine_mixed$results_annotated %>%
   filter(EntrezGeneSymbol %in% pt_urine_genes) %>%
   dplyr::select(Gene = EntrezGeneSymbol, SeqId, logFC_urine = logFC, p.value_urine = P.Value)
 
+# get transcript DiD logFC for those same genes
 did_trans_pt_u <- pt_kpmp %>%
   filter(Gene %in% pt_urine_genes) %>%
   dplyr::select(Gene, logFC_transcript = `logFC_treatmentDapagliflozin:visitPOST`, p.value_transcript = `p_treatmentDapagliflozin:visitPOST`)
 
+# merge and classify concordance direction (U+/T+, U-/T-, discordant, NS)
 urine_pt_merge <- full_join(did_urine_pt, did_trans_pt_u) %>%
   mutate(direction = case_when(logFC_urine > 0 & p.value_urine < 0.05 & logFC_transcript > 0 & p.value_transcript < 0.05 ~ "U+/T+",
                                logFC_urine < 0 & p.value_urine < 0.05 & logFC_transcript < 0 & p.value_transcript < 0.05 ~ "U-/T-",
@@ -1126,6 +1071,7 @@ theme_transparent <- theme(
   legend.background = element_rect(fill = "transparent", color = NA)
 )
 
+# label top 20 concordant/discordant genes in each direction for volcano
 pos_labels <- urine_pt_merge %>%
   filter(direction != "NS" & logFC_urine > 0) %>%
   arrange(p.value_urine) %>%
@@ -1136,6 +1082,7 @@ neg_labels <- urine_pt_merge %>%
   head(20)
 labels_dat <- rbind(pos_labels, neg_labels)
 
+# volcano plot showing urine protein DiD colored by transcript concordance (PT)
 urine_pt_merge %>%
   ggplot(aes(x = logFC_urine, y = -log10(p.value_urine), color = direction)) +
   geom_hline(yintercept = -log10(0.05), color = "darkgrey", linetype = "dashed") +
@@ -1153,7 +1100,8 @@ urine_pt_merge %>%
 ```
 
 ```{r echo = F}
-plot_volcano(pt_urine, 
+# volcano for PT transcript-protein association and directional concordance plot
+plot_volcano(pt_urine,
              fc = "logFC_log2(protein)", 
              p_col = "p_log2(protein)", 
              x_axis = "logFC log2(protein)", 
@@ -1170,22 +1118,23 @@ create_directional_volcano(
   protein_data = pt_urine %>% filter(`logFC_log2(protein)` > -10),
   cell_type_name = "PT"
 )
-ggsave(file.path(root_path, "ATTEMPT/Results/Figures/Proteomics/Volcano Plots/urine_pt.png"))
+ggsave(file.path(results_dir, "Figures/Proteomics/Volcano Plots/urine_pt.png"))
 ```
 
 ```{r echo = F}
+# quantify PT transcript-protein concordance for urine proteomics
 pt_concordance_urine <- concordance_by_celltype(
   biofluid_df = pt_urine,
   scrna_df    = pt_kpmp,
   biofluid_label = "urine",
   celltype = "PT",
-  out_dir = file.path(root_path, "ATTEMPT/Results/Somascan/Transcript concordance")
+  out_dir = file.path(results_dir, "Somascan/Transcript concordance")
 )
 ```
 
 ```{r echo = F}
+# load and process TAL transcript-protein association results
 tal_urine_raw <- s3readRDS("Proteomics/tal_nebula_urine_soma_res_kpmp.rds", "attempt", region = "")
-tal_urine_raw$results$ISG15_seq.14148.2_urine_cradj
 tal_urine <- process_nebula_results(tal_urine_raw$results, pval_col = "p_log2(protein)")$results
 tal_urine <- tal_urine %>%
   mutate(Gene = sub("_.*", "", Gene))
@@ -1193,6 +1142,7 @@ tal_urine <- subset(tal_urine, `logFC_log2(protein)` > -1) # 2 outliers
 ```
 
 ```{r echo = F}
+# volcano for TAL transcript-protein association and directional concordance plot
 plot_volcano(tal_urine, fc = "logFC_log2(protein)", p_col = "p_log2(protein)", x_axis = "logFC log2(protein)", y_axis = "-log10(p.value)", file_suffix = "_kpmp_tal_urine",
              formula = "log2(protein) + treatment", 
              cell_type = "TAL",
@@ -1205,22 +1155,23 @@ create_directional_volcano(
   protein_data = tal_urine %>% filter(`logFC_log2(protein)` > -10),
   cell_type_name = "TAL"
 )
-ggsave(file.path(root_path, "ATTEMPT/Results/Figures/Proteomics/Volcano Plots/urine_tal.png"))
+ggsave(file.path(results_dir, "Figures/Proteomics/Volcano Plots/urine_tal.png"))
 ```
 
 ```{r echo = F}
+# quantify TAL transcript-protein concordance for urine proteomics
 tal_concordance_urine <- concordance_by_celltype(
   biofluid_df = tal_urine,
   scrna_df    = tal_kpmp,
   biofluid_label = "urine",
   celltype = "TAL",
-  out_dir = file.path(root_path, "ATTEMPT/Results/Somascan/Transcript concordance")
+  out_dir = file.path(results_dir, "Somascan/Transcript concordance")
 )
 ```
 
 ```{r echo = F}
+# load and process DCT transcript-protein association results
 dct_urine_raw <- s3readRDS("Proteomics/dct_nebula_urine_soma_res_kpmp.rds", "attempt", region = "")
-dct_urine_raw$results$ISG15_seq.14148.2_urine_cradj
 dct_urine <- process_nebula_results(dct_urine_raw$results, pval_col = "p_log2(protein)")$results
 dct_urine <- dct_urine %>%
   mutate(Gene = sub("_.*", "", Gene))
@@ -1228,6 +1179,7 @@ dct_urine <- subset(dct_urine, `logFC_log2(protein)` < 1) # 2 outliers
 ```
 
 ```{r echo = F}
+# volcano for DCT transcript-protein association and directional concordance plot
 plot_volcano(dct_urine, fc = "logFC_log2(protein)", p_col = "p_log2(protein)", x_axis = "logFC log2(protein)", y_axis = "-log10(p.value)", file_suffix = "_kpmp_dct_urine",
              formula = "log2(protein) + treatment", cell_type = "DCT",
              positive_text = "Positively associated\nwith transcript",
@@ -1239,29 +1191,30 @@ create_directional_volcano(
   protein_data = dct_urine %>% filter(`logFC_log2(protein)` > -10),
   cell_type_name = "DCT"
 )
-ggsave(file.path(root_path, "ATTEMPT/Results/Figures/Proteomics/Volcano Plots/urine_dct.png"))
+ggsave(file.path(results_dir, "Figures/Proteomics/Volcano Plots/urine_dct.png"))
 ```
 
 ```{r echo = F}
+# quantify DCT transcript-protein concordance for urine proteomics
 dct_concordance_urine <- concordance_by_celltype(
   biofluid_df = dct_urine,
   scrna_df    = dct_kpmp,
   biofluid_label = "urine",
   celltype = "DCT",
-  out_dir = file.path(root_path, "ATTEMPT/Results/Somascan/Transcript concordance")
+  out_dir = file.path(results_dir, "Somascan/Transcript concordance")
 )
 ```
 
 ```{r echo = F}
+# load and process CD (collecting duct) transcript-protein association results
 cd_urine_raw <- s3readRDS("Proteomics/cd_nebula_urine_soma_res_kpmp.rds", "attempt", region = "")
-cd_urine_raw$results$ISG15_seq.14148.2_urine_cradj
 cd_urine <- process_nebula_results(cd_urine_raw$results, pval_col = "p_log2(protein)")$results
 cd_urine <- cd_urine %>%
   mutate(Gene = sub("_.*", "", Gene))
-# cd_urine <- subset(cd_urine, `logFC_log2(protein)` < 1) # 2 outliers
 ```
 
 ```{r echo = F}
+# volcano for CD transcript-protein association and directional concordance plot
 plot_volcano(cd_urine, fc = "logFC_log2(protein)", p_col = "p_log2(protein)", x_axis = "logFC log2(protein)", y_axis = "-log10(p.value)", file_suffix = "_kpmp_cd_urine",
              formula = "log2(protein) + treatment", cell_type = "CD",
              positive_text = "Positively associated\nwith transcript",
@@ -1273,29 +1226,30 @@ create_directional_volcano(
   protein_data = cd_urine %>% filter(`logFC_log2(protein)` > -10),
   cell_type_name = "CD"
 )
-ggsave(file.path(root_path, "ATTEMPT/Results/Figures/Proteomics/Volcano Plots/urine_cd.png"))
+ggsave(file.path(results_dir, "Figures/Proteomics/Volcano Plots/urine_cd.png"))
 ```
 
 ```{r echo = F}
+# quantify CD transcript-protein concordance for urine proteomics
 cd_concordance_urine <- concordance_by_celltype(
   biofluid_df = cd_urine,
   scrna_df    = cd_kpmp,
   biofluid_label = "urine",
   celltype = "CD",
-  out_dir = file.path(root_path, "ATTEMPT/Results/Somascan/Transcript concordance")
+  out_dir = file.path(results_dir, "Somascan/Transcript concordance")
 )
 ```
 
 ```{r echo = F}
+# load and process POD (podocyte) transcript-protein association results
 pod_urine_raw <- s3readRDS("Proteomics/pod_nebula_urine_soma_res_kpmp.rds", "attempt", region = "")
-pod_urine_raw$results$ISG15_seq.14148.2_urine_cradj
 pod_urine <- process_nebula_results(pod_urine_raw$results, pval_col = "p_log2(protein)")$results
 pod_urine <- pod_urine %>%
   mutate(Gene = sub("_.*", "", Gene))
-# pod_urine <- subset(pod_urine, `logFC_log2(protein)` < 1) # 2 outliers
 ```
 
 ```{r echo = F}
+# volcano for POD transcript-protein association and directional concordance plot
 plot_volcano(pod_urine, fc = "logFC_log2(protein)", p_col = "p_log2(protein)", x_axis = "logFC log2(protein)", y_axis = "-log10(p.value)", file_suffix = "_kpmp_pod_urine",
              formula = "log2(protein) + treatment", cell_type = "POD",
              positive_text = "Positively associated\nwith transcript",
@@ -1307,30 +1261,31 @@ create_directional_volcano(
   protein_data = pod_urine %>% filter(`logFC_log2(protein)` > -10),
   cell_type_name = "POD"
 )
-ggsave(file.path(root_path, "ATTEMPT/Results/Figures/Proteomics/Volcano Plots/urine_pod.png"))
+ggsave(file.path(results_dir, "Figures/Proteomics/Volcano Plots/urine_pod.png"))
 ```
 
 ```{r echo = F}
+# quantify POD transcript-protein concordance for urine proteomics
 pod_concordance_urine <- concordance_by_celltype(
   biofluid_df = pod_urine,
   scrna_df    = pod_kpmp,
   biofluid_label = "urine",
   celltype = "POD",
-  out_dir = file.path(root_path, "ATTEMPT/Results/Somascan/Transcript concordance")
+  out_dir = file.path(results_dir, "Somascan/Transcript concordance")
 )
 ```
 
 ```{r echo = F}
+# load and process combined (PT+TAL+DCT+CD+POD) transcript-protein results
 combined_urine_raw <- s3readRDS("Proteomics/combined_nebula_urine_soma_res_kpmp.rds", "attempt", region = "")
 combined_urine <- process_nebula_results(combined_urine_raw$results, pval_col = "p_log2(protein)")$results
 combined_urine <- combined_urine %>%
   mutate(Gene = sub("_.*", "", Gene))
-# combined_urine <- subset(combined_urine, `logFC_log2(protein)` < 1) # 2 outliers
-combined_urine
 ```
 
 ```{r echo = F}
-plot_volcano(combined_urine, 
+# volcano for combined cell type transcript-protein association and concordance
+plot_volcano(combined_urine,
              fc = "logFC_log2(protein)", 
              p_col = "p_log2(protein)", 
              x_axis = "logFC log2(protein)", 
@@ -1348,38 +1303,35 @@ create_directional_volcano(
   protein_data = combined_urine %>% filter(`logFC_log2(protein)` > -10),
   cell_type_name = "Combined (PT, TAL, DCT, CD, POD)"
 ) + coord_cartesian(clip = "off")
-ggsave(file.path(root_path, "ATTEMPT/Results/Figures/Proteomics/Volcano Plots/urine_combined.png"))
+ggsave(file.path(results_dir, "Figures/Proteomics/Volcano Plots/urine_combined.png"))
 ```
 
 ```{r echo = F}
+# quantify combined transcript-protein concordance for urine proteomics
 combined_concordance_urine <- concordance_by_celltype(
   biofluid_df = combined_urine,
   scrna_df    = combined_u_kpmp,
   biofluid_label = "urine",
   celltype = "Combined",
-  out_dir = file.path(root_path, "ATTEMPT/Results/Somascan/Transcript concordance")
+  out_dir = file.path(results_dir, "Somascan/Transcript concordance")
 )
 ```
 
 # Looking for overlap between treatment DiD & proteomics DiD
 
 ```{r echo = F}
-## read mixed model results dataframe (rendered in Hyak)
-# process and read all results from ATTEMPT
+# redefine cell type groups for treatment DiD overlap analysis (PT, IC, POD only)
 celltype_groups <- list(
   PT = c("PT-S1/S2", "PT-S3", "aPT"),
   # TAL = c("C-TAL-1", "C-TAL-2", "aTAL", "dTAL"),
   # PC = c("CCD-PC", "CNT-PC", "dCCD-PC", "M-PC", "tPC-IC"),
   IC = c("IC-A", "IC-B", "aIC"),
-  # DCT = c("DCT","dDCT"), 
+  # DCT = c("DCT","dDCT"),
   POD = "POD"
 )
 
-## read mixed model results dataframe (rendered in Hyak)
-# process and read all results from ATTEMPT
-# Full gene set
+# load grouped nebula treatment DiD results for PT, IC, POD
 for (cell in names(celltype_groups))  {
-print(paste0("Processing: ", cell))
   input_path <- paste0("grouped/", cell, "/ALL/nebula/", "grouped_", tolower(cell), "_kpmp_attempt_nebula_res_reml_pooled.rds")
   cell_df <- s3readRDS(input_path, bucket = "attempt", region = "")
 
@@ -1392,10 +1344,11 @@ print(paste0("Processing: ", cell))
 ```
 
 ```{r echo = F}
+# batch concordance analysis: overlap between urine protein DiD and transcript DiD
 urine_res <- batch_concordance_analysis(
   protein_data = did_res_urine_mixed$results_annotated,  # This is correct
   transcript_data_list = list(PT = pt_kpmp, IC = ic_kpmp, POD = pod_kpmp),
   protein_source = 'urine',
-  output_dir = "/Users/choiyej/Library/CloudStorage/OneDrive-SharedLibraries-UW/Laura Pyle - Bjornstad/Biostatistics Core Shared Drive/ATTEMPT/Results/Figures/Pathways/enrichr"
+  output_dir = file.path(results_dir, "Figures/Pathways/enrichr")
 )
 ```

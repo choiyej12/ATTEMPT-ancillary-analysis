@@ -12,6 +12,7 @@ format:
 ---
 
 ```{r echo = F, include = F}
+# load required packages
 library(dplyr)
 library(kableExtra)
 library(knitr)
@@ -32,12 +33,16 @@ library(forcats)
 library(stringr)
 library(jsonlite)
 library(aws.s3)
-source("~/GitHub/CHCO-Code/Petter Bjornstad/ATTEMPT/attempt_functions.R")
+library(here)
+
+# source shared ATTEMPT analysis functions (from this repository)
+source(here("attempt_functions.R"))
 ```
 
 ```{r include = F}
-## Create an S3 client
-keys <- fromJSON("/Users/choiyej/Library/CloudStorage/OneDrive-TheUniversityofColoradoDenver/Bjornstad Pyle Lab/keys.json")
+# configure S3 connection to Kopah (UW research storage)
+# NOTE: users must provide their own keys.json with AWS credentials
+keys <- fromJSON(Sys.getenv("ATTEMPT_KEYS_PATH", unset = "keys.json"))
 
 Sys.setenv(
   "AWS_ACCESS_KEY_ID" = keys$MY_ACCESS_KEY,
@@ -53,6 +58,7 @@ Sys.setenv(
 ## read mixed model results dataframe (rendered in Hyak)
 # process and read all results from CROCODILE (limited to significant results from ATTEMPT non-HVG model)
 
+# cell type groupings mapping KPMP subtypes to broader cell type groups
 celltype_groups <- list(
   PT = c("PT-S1/S2", "PT-S3", "aPT"),
   TAL = c("C-TAL-1", "C-TAL-2", "aTAL", "dTAL"),
@@ -66,21 +72,22 @@ celltype_groups <- list(
   POD = "POD"
 )
 
-# Top 2000 HVG
+# read CROCODILE HVG (top 2000) nebula results from S3 for each cell type
+# these are T1D vs HC comparisons from the CROCODILE cohort
 for (cell in names(celltype_groups))  {
   input_path <- paste0("/CROCODILE comparison analysis/", toupper(cell), "/nebula/", tolower(cell),"_kpmp_croc_hvg.rds")
   cell_df <- s3readRDS(input_path, bucket = "attempt", region = "")
-  
+
   processed <- process_nebula_results(cell_df, pval_col = "p_groupType_1_Diabetes")
   lower_cell <- tolower(cell)
   var_name <- paste0(lower_cell, "_croc_untargeted_res_hvg")
-  
+
   assign(var_name, processed$results)
-  
-  write.csv(processed$results, paste0("/Users/choiyej/Library/CloudStorage/OneDrive-SharedLibraries-UW/Laura Pyle - Bjornstad/Biostatistics Core Shared Drive/ATTEMPT/Results/nebula/", tolower(cell), "_kpmp_croc_hvg_res.csv"), row.names = F)
+
+  write.csv(processed$results, file.path(results_dir, "nebula", paste0(tolower(cell), "_kpmp_croc_hvg_res.csv")), row.names = F)
 }
 
-# Targeted
+# read CROCODILE targeted gene set nebula results (genes significant in ATTEMPT)
 for (cell in names(celltype_groups))  {
   input_path <- paste0("/CROCODILE comparison analysis/", toupper(cell), "/nebula/", tolower(cell),"_kpmp_croc_attempt_targeted.rds")
   cell_df <- s3readRDS(input_path, bucket = "attempt", region = "")
@@ -91,13 +98,13 @@ for (cell in names(celltype_groups))  {
   
   assign(var_name, processed$results)
   
-  write.csv(processed$results, paste0("/Users/choiyej/Library/CloudStorage/OneDrive-SharedLibraries-UW/Laura Pyle - Bjornstad/Biostatistics Core Shared Drive/ATTEMPT/Results/nebula/", tolower(cell), "_kpmp_croc_targeted_res.csv"), row.names = F)
+  write.csv(processed$results, file.path(results_dir, "nebula", paste0(tolower(cell), "_kpmp_croc_targeted_res.csv")), row.names = F)
 }
 ```
 
 ```{r echo = F}
 ## read mixed model results dataframe (rendered in Hyak)
-# process and read all results from ATTEMPT
+# read ATTEMPT DiD nebula results for comparison with CROCODILE
 celltype_groups <- list(
   PT = c("PT-S1/S2", "PT-S3", "aPT"),
   TAL = c("C-TAL-1", "C-TAL-2", "aTAL", "dTAL"),
@@ -131,24 +138,24 @@ for (cell in names(celltype_groups))  {
 ### Targeted
 
 ```{r echo = F}
+# volcano plots for targeted genes: CROCODILE T1D vs HC with ATTEMPT DiD direction labels
 for (cell in names(celltype_groups)) {
-  message("Processing: ", cell)
   plot_croc_attempt_volcano(
     attempt_df = get(paste0(tolower(cell), "_kpmp")),
     croc_df = get(paste0(tolower(cell), "_croc_targeted_res")),
     cell_type = cell,
     top_n = 20,
-    save_path = paste0("/Users/choiyej/Library/CloudStorage/OneDrive-SharedLibraries-UW/Laura Pyle - Bjornstad/Biostatistics Core Shared Drive/ATTEMPT/Results/Figures/CROCODILE comparison/Volcano Plots/kpmp_", tolower(cell), "_targeted_volcano_attempt_directions_labeled.png")
+    save_path = file.path(results_dir, "Figures/CROCODILE comparison/Volcano Plots", paste0("kpmp_", tolower(cell), "_targeted_volcano_attempt_directions_labeled.png"))
   )
 }
 ```
 
 ```{r echo = F}
+# standalone CROCODILE targeted volcano plots (raw p-value and FDR versions)
 for (cell in names(celltype_groups)) {
-  message("Processing: ", cell)
   plot_volcano(
     data = get(paste0(tolower(cell), "_croc_targeted_res")),
-    fc = "logFC_groupType_1_Diabetes", 
+    fc = "logFC_groupType_1_Diabetes",
     p_col = "p_groupType_1_Diabetes",
     title = NULL,
     x_axis = "logFC group (Type 1 Diabetes)", 
@@ -173,21 +180,21 @@ for (cell in names(celltype_groups)) {
 ### Untargeted
 
 ```{r echo = F}
+# volcano plots for untargeted HVG set: CROCODILE with ATTEMPT direction labels
 for (cell in names(celltype_groups)) {
-  message("Processing: ", cell)
   plot_croc_attempt_volcano(
     attempt_df = get(paste0(tolower(cell), "_kpmp")),
     croc_df = get(paste0(tolower(cell), "_croc_untargeted_res_hvg")),
     cell_type = cell,
     top_n = 20,
-    save_path = paste0("/Users/choiyej/Library/CloudStorage/OneDrive-SharedLibraries-UW/Laura Pyle - Bjornstad/Biostatistics Core Shared Drive/ATTEMPT/Results/Figures/CROCODILE comparison/Volcano Plots/kpmp_", tolower(cell), "_untargeted_volcano_attempt_directions_labeled.png")
+    save_path = file.path(results_dir, "Figures/CROCODILE comparison/Volcano Plots", paste0("kpmp_", tolower(cell), "_untargeted_volcano_attempt_directions_labeled.png"))
   )
 }
 ```
 
 ```{r echo = F}
+# standalone CROCODILE HVG volcano plots (raw p-value and FDR versions)
 for (cell in names(celltype_groups)) {
-  message("Processing: ", cell)
   plot_volcano(
     data = get(paste0(tolower(cell), "_croc_untargeted_res_hvg")),
     fc = "logFC_groupType_1_Diabetes", 
@@ -219,8 +226,7 @@ library(ggplot2)
 library(ggpubr)
 library(patchwork)
 
-# Manual functional grouping based on your actual genes
-# You'll need to customize these based on the genes shown in your heatmaps
+# manual functional gene groupings for heatmap bracket annotations per cell type
 kidney_gene_groups <- list(
   PT = list(
     # Group genes from your PT heatmap
@@ -274,7 +280,7 @@ kidney_gene_groups <- list(
   )
 )
 
-# Function to assign genes to functional groups - more flexible version
+# assign each gene to its functional group, defaulting to "Other" if not listed
 assign_gene_functions <- function(genes, cell_type, custom_groups = NULL) {
   # Use custom groups if provided, otherwise use default
   gene_groups <- if(!is.null(custom_groups) && cell_type %in% names(custom_groups)) {
@@ -304,7 +310,7 @@ assign_gene_functions <- function(genes, cell_type, custom_groups = NULL) {
   return(gene_df)
 }
 
-# Function to create bracket annotations - improved version
+# compute y-positions for functional group bracket annotations on the heatmap
 create_functional_brackets <- function(plot_df, cell_type) {
   # Get unique genes in order (excluding padding)
   genes_unique <- plot_df %>%
@@ -326,11 +332,6 @@ create_functional_brackets <- function(plot_df, cell_type) {
     mutate(Gene = factor(Gene, levels = gene_order)) %>%
     arrange(Gene) %>%
     mutate(y_position = as.numeric(Gene))
-  
-  # Debug: print what we're working with
-  message("Cell type: ", cell_type)
-  message("Number of genes: ", nrow(gene_functions))
-  message("Functional groups found: ", paste(unique(gene_functions$functional_group), collapse = ", "))
   
   # Find consecutive genes with same function
   brackets <- list()
@@ -363,31 +364,30 @@ create_functional_brackets <- function(plot_df, cell_type) {
     }
   }
   
-  message("Number of brackets created: ", length(brackets))
   return(brackets)
 }
 
-# Modified plotting code for each cell type
+# create side-by-side heatmaps of top 50 reversed genes (CROCODILE vs ATTEMPT logFC)
+# genes ordered by functional group, with bracket annotations on right side
 for (cell in names(celltype_groups)) {
-  message("\n=== Processing: ", cell, " ===")
-  
   top_n = 50
   target_n = top_n*2
+  # merge ATTEMPT and CROCODILE results, classify genes as reversed or non-reversed
   croc_attempt_df <- create_croc_attempt_df(
     attempt_df = get(paste0(tolower(cell), "_kpmp")),
     croc_df = get(paste0(tolower(cell), "_croc_targeted_res")),
     cell_type = cell
   )
-  
+
   n_reversed = croc_attempt_df %>%
     filter(direction == "reversed") %>%
     nrow()
-  
+
   n_nonreversed = croc_attempt_df %>%
     filter(direction == "non-reversed") %>%
     nrow()
-  
-  # First, get top genes by p-value
+
+  # select top 50 reversed genes by CROCODILE p-value
   top_genes_df <- croc_attempt_df %>%
     filter(direction == "reversed") %>%
     arrange(p.val_croc) %>%
@@ -406,7 +406,7 @@ for (cell in names(celltype_groups)) {
     arrange(group_sort, p.val_croc) %>%
     select(-group_sort)
   
-  # Now pivot longer
+  # pivot to long format with one row per gene per study for heatmap plotting
   croc_attempt_df <- top_genes_df %>%
     pivot_longer(
       cols = c(logFC_attempt, p.val_attempt, logFC_croc, p.val_croc),
@@ -417,7 +417,7 @@ for (cell in names(celltype_groups)) {
     mutate(diff_logFC = logFC[study == "attempt"] - logFC[study == "croc"]) %>%
     ungroup()
   
-  # Padding if needed - add at the end instead of beginning
+  # add invisible placeholder rows so all cell type heatmaps have uniform height
   if (nrow(croc_attempt_df) < target_n) {
     n_add <- (target_n - nrow(croc_attempt_df))/2
     placeholder_genes <- paste0("_", seq_len(n_add))  # Add underscore to make clear they're placeholders
@@ -530,7 +530,7 @@ for (cell in names(celltype_groups)) {
   assign(paste0(tolower(cell), "_croc_attempt_heat"), p)
 }
 
-# Combine all plots
+# combine all cell type heatmaps into one panel figure
 final_plot <- ggarrange(
   pt_croc_attempt_heat, tal_croc_attempt_heat, ec_croc_attempt_heat,
   ic_croc_attempt_heat, pod_croc_attempt_heat+ coord_cartesian(xlim = c(1, 2.1), clip = "off"), 
@@ -540,14 +540,13 @@ final_plot <- ggarrange(
 )
 
 print(final_plot)
-ggsave(file.path(root_path, "ATTEMPT/Results/Figures/Panels/croc_attempt_rev_heatmap_2.png"), width = 12, height = 12)
+ggsave(file.path(results_dir, "Figures/Panels/croc_attempt_rev_heatmap_2.png"), width = 12, height = 12)
 
 ```
 
 ```{r echo = F}
+# alternative heatmaps: same reversed genes but ordered by logFC difference instead of functional groups
 for (cell in names(celltype_groups)) {
-  message("Processing: ", cell)
-  
   top_n = 50
   target_n = top_n*2
   croc_attempt_df <- create_croc_attempt_df(attempt_df = get(paste0(tolower(cell), "_kpmp")),
@@ -638,5 +637,5 @@ ggarrange(pt_croc_attempt_heat, tal_croc_attempt_heat, ec_croc_attempt_heat,
           common.legend = T, nrow = 1, hjust = 0, vjust = 0.8)
 
 
-ggsave(file.path(root_path, "ATTEMPT/Results/Figures/Panels/croc_attempt_rev_heatmap.png"), width = 12, height = 12)
+ggsave(file.path(results_dir, "Figures/Panels/croc_attempt_rev_heatmap.png"), width = 12, height = 12)
 ```

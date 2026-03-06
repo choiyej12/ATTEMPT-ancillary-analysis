@@ -1,26 +1,19 @@
+# color palettes for plots
 color_5 <- c("#264653", "#2a9d8f", "#e9c46a", "#f4a261", "#e76f51")
 color_9 <- c("#264653", "#2a9d8f", "#e9c46a", "#f4a261", "#e76f51", "#a8dadc", "#457b9d", "#1d3557", "#f1faee")
 
+# helper to clean up parallel backend registration
 unregister_dopar <- function() {
   env <- foreach:::.foreachGlobals
   rm(list=ls(name=env), pos=env)
 }
 
-# specify user for paths
-user <- Sys.info()[["user"]]
-
-if (user == "choiyej") { # local version
-  root_path <- "/Users/choiyej/Library/CloudStorage/OneDrive-SharedLibraries-UW/Laura Pyle - Bjornstad/Biostatistics Core Shared Drive"
-  git_path <- "/Users/choiyej/GitHub/CHCO-Code/Petter Bjornstad"
-} else if (user == "yejichoi") { # hyak version
-  root_path <- ""
-  git_path <- "/mmfs1/gscratch/togo/yejichoi/CHCO-Code/Petter Bjornstad"
-} else if (user == "pylell") {
-  root_path <- "/Users/pylell/Library/CloudStorage/OneDrive-SharedLibraries-UW/Bjornstad/Biostatistics Core Shared Drive"
-  git_path <- "/Users/pylell/Documents/GitHub/CHCO-Code/Petter Bjornstad"
-} else {
-  stop("Unknown user: please specify root path for this user.")
-}
+# set project root using here package for portable paths
+# NOTE: users should set root_path to point to the shared data drive location
+# and results_dir to where output files should be saved
+if (!requireNamespace("here", quietly = TRUE)) install.packages("here")
+root_path <- Sys.getenv("ATTEMPT_DATA_PATH", unset = here::here("data"))
+results_dir <- Sys.getenv("ATTEMPT_RESULTS_PATH", unset = here::here("results"))
 
 # ATTEMPT analysis related functions
 
@@ -28,6 +21,7 @@ if (user == "choiyej") { # local version
 # make_subsets
 #----------------------------------------------------------#
 
+# subset a Seurat object by cell type groups and assign each subset to the global env
 make_subsets <- function(so, groups, celltype_col = "celltype", prefix = "croc_so_") {
   stopifnot(celltype_col %in% colnames(so@meta.data))
   
@@ -65,6 +59,7 @@ make_subsets <- function(so, groups, celltype_col = "celltype", prefix = "croc_s
 # run_nebula_for_clinvar
 #----------------------------------------------------------#
 
+# run NEBULA for a single clinical variable within specified cell types, upload results to S3
 run_nebula_for_clinvar <- function(
     seurat_obj,
     celltype_values,                 # e.g., c("PT-S1/S2","PT-S3","aPT")
@@ -220,6 +215,7 @@ run_nebula_for_clinvar <- function(
 # run_nebula_by_groups
 #----------------------------------------------------------#
 
+# loop run_nebula_for_clinvar over multiple cell type groups and clinical variables
 run_nebula_by_groups <- function(
     seurat_obj,
     celltype_groups,        # named list: group -> vector of celltype values
@@ -272,6 +268,7 @@ run_nebula_by_groups <- function(
 # run_ancova
 #----------------------------------------------------------#
 
+# run ANCOVA adjusted for baseline value, extract treatment contrasts via emmeans
 run_ancova <- function(data, outcome_var, baseline_var, visit_week) {
   outcome_sym <- rlang::sym(outcome_var)
   baseline_sym <- rlang::sym(baseline_var)
@@ -316,27 +313,22 @@ run_ancova <- function(data, outcome_var, baseline_var, visit_week) {
 #----------------------------------------------------------#
 # run_doubletfinder_custom runs Doublet_Finder() and returns a dataframe with the cell IDs and a column with either 'Singlet' or 'Doublet'
 run_doubletfinder_custom <- function(seu_sample_subset, multiplet_rate = NULL){
-  # for debug
-  #seu_sample_subset <- samp_split[[1]]
-  # Print sample number
-  print(paste0("Sample ", unique(seu_sample_subset[['SampleID']]), '...........')) 
-  
+  message(paste0("Sample ", unique(seu_sample_subset[['SampleID']])))
+
   if(is.null(multiplet_rate)){
-    print('multiplet_rate not provided....... estimating multiplet rate from cells in dataset')
-    
+    message('multiplet_rate not provided, estimating multiplet rate from cells in dataset')
+
     # 10X multiplet rates table
     #https://rpubs.com/kenneditodd/doublet_finder_example
     multiplet_rates_10x <- data.frame('Multiplet_rate'= c(0.004, 0.008, 0.0160, 0.023, 0.031, 0.039, 0.046, 0.054, 0.061, 0.069, 0.076),
                                       'Loaded_cells' = c(800, 1600, 3200, 4800, 6400, 8000, 9600, 11200, 12800, 14400, 16000),
                                       'Recovered_cells' = c(500, 1000, 2000, 3000, 4000, 5000, 6000, 7000, 8000, 9000, 10000))
-    
-    print(multiplet_rates_10x)
-    
-    multiplet_rate <- multiplet_rates_10x %>% dplyr::filter(Recovered_cells < nrow(seu_sample_subset@meta.data)) %>% 
+
+    multiplet_rate <- multiplet_rates_10x %>% dplyr::filter(Recovered_cells < nrow(seu_sample_subset@meta.data)) %>%
       dplyr::slice(which.max(Recovered_cells)) %>% # select the min threshold depending on your number of samples
       dplyr::select(Multiplet_rate) %>% as.numeric(as.character()) # get the expected multiplet rate for that number of recovered cells
-    
-    print(paste('Setting multiplet rate to', multiplet_rate))
+
+    message(paste('Setting multiplet rate to', multiplet_rate))
   }
   
   # Pre-process seurat object with standard seurat workflow --- 
@@ -389,10 +381,6 @@ run_doubletfinder_custom <- function(seu_sample_subset, multiplet_rate = NULL){
   # change name of metadata column with Singlet/Doublet information
   colnames(sample@meta.data)[grepl('DF.classifications.*', colnames(sample@meta.data))] <- "doublet_finder"
   
-  # Subset and save
-  # head(sample@meta.data['doublet_finder'])
-  # singlets <- subset(sample, doublet_finder == "Singlet") # extract only singlets
-  # singlets$ident
   double_finder_res <- sample@meta.data['doublet_finder'] # get the metadata column with singlet, doublet info
   double_finder_res <- rownames_to_column(double_finder_res, "row_names") # add the cell IDs as new column to be able to merge correctly
   return(double_finder_res)
@@ -403,6 +391,7 @@ run_doubletfinder_custom <- function(seu_sample_subset, multiplet_rate = NULL){
 # Function: run_nebula_parallel
 # ===========================================================================
 
+# run NEBULA NBLMM per gene in parallel with grouped cell structure and optional S3 upload
 run_nebula_parallel <- function(seurat_obj,
                                 n_cores = 100,
                                 layer = "counts",
@@ -537,9 +526,10 @@ run_nebula_parallel <- function(seurat_obj,
 # Function: process_nebula_results
 # ===========================================================================
 
-process_nebula_results <- function(nebula_list, 
-                                   pval_col = "p_treatmentDapagliflozin:visitPOST", 
+process_nebula_results <- function(nebula_list,
+                                   pval_col = "p_treatmentDapagliflozin:visitPOST",
                                    convergence_cut = -10) {
+  # extract per-gene convergence codes, filter to converged models, combine summaries, add FDR
   # Extract convergence codes
   convergence_df <- purrr::map_dfr(names(nebula_list), function(gene_name) {
     convergence_code <- nebula_list[[gene_name]]$convergence
@@ -586,7 +576,7 @@ process_nebula_results <- function(nebula_list,
 
 process_nebula_results_clin <- function(cell_type, clinical_var, cell_subtype,
                                         bucket = "attempt", region = "",
-                                        output_dir = "/Users/choiyej/Library/CloudStorage/OneDrive-SharedLibraries-UW/Laura Pyle - Bjornstad/Biostatistics Core Shared Drive/ATTEMPT/Results/nebula/") {
+                                        output_dir = file.path(results_dir, "nebula")) {
   
   # Construct file path
   clean_subtype <- paste(
@@ -682,10 +672,6 @@ process_nebula_results_clin <- function(cell_type, clinical_var, cell_subtype,
     overdispersion = res_combined_disp
   ))
 }
-
-# Example usage:
-# pt_mgfr_jodal_results <- process_nebula_results(cell_type = "pt", clinical_var = "mgfr_jodal")
-# cd4_glucose_results <- process_nebula_results(cell_type = "cd4", clinical_var = "glucose_level")
 
 
 # ===========================================================================
@@ -1201,7 +1187,7 @@ plot_volcano_proteomics <- function(data, fc, p_col, title = NULL, x_axis, y_axi
                                     formula = "group", legend_position = c(0.8, 0.9),
                                     text_size = 15, caption_size = 8.5,
                                     top_n = 20,
-                                    output_base_path = file.path(root_path, "ATTEMPT/Results/Figures/Proteomics/Volcano Plots/Volcano"),
+                                    output_base_path = file.path(results_dir, "Figures/Proteomics/Volcano Plots/Volcano"),
                                     geom_text_size = 3,
                                     arrow_padding = 0.09,
                                     arrow_text_padding = 0.14,
@@ -1415,14 +1401,15 @@ create_directional_volcano <- function(rna_data, protein_data, cell_type_name,
 # ===========================================================================
 # Function: plot_volcano (for transcripts)
 # ===========================================================================
+# volcano plot for transcript-level DE results with top gene labels and off-chart handling
 plot_volcano <- function(data, fc, p_col, title = NULL, x_axis, y_axis, file_suffix, p_thresh = 0.05,
-                         positive_text = "Positive with Dapagliflozin", 
+                         positive_text = "Positive with Dapagliflozin",
                          negative_text = "Negative with Dapagliflozin",
                          formula = "group", legend_position = c(0.8, 0.9),
                          full_formula = F,
                          text_size = 15, caption_size = 8.5,
                          cell_type = "",
-                         output_base_path = file.path(root_path, "ATTEMPT/Results/Figures/Volcano Plots/"),
+                         output_base_path = file.path(results_dir, "Figures/Volcano Plots/"),
                          geom_text_size = 3,
                          arrow_padding = 0.09,
                          arrow_text_padding = 0.14,
@@ -1784,7 +1771,7 @@ plot_volcano_associations <- function(clin_results, fc, p_col, title_suffix,
     guides(shape = "none")
   
   # Save
-  ggsave(paste0(file.path(root_path, "ATTEMPT/Results/Figures/Volcano Plots/"), file_suffix, ".png"), plot = p, width = 7, height = 5)
+  ggsave(paste0(file.path(results_dir, "Figures/Volcano Plots/"), file_suffix, ".png"), plot = p, width = 7, height = 5)
   
   return(p)
 }
@@ -2063,7 +2050,7 @@ plot_volcano_concordance <- function(clin_results, fc, p_col,
   
   # Save
   if (save) {
-    ggsave(paste0(file.path(root_path, "ATTEMPT/Results/Figures/Volcano Plots/"), file_suffix, "_concordance.png"), plot = p, width = 7, height = 5)
+    ggsave(paste0(file.path(results_dir, "Figures/Volcano Plots/"), file_suffix, "_concordance.png"), plot = p, width = 7, height = 5)
     
     return(p)
     
@@ -2072,9 +2059,10 @@ plot_volcano_concordance <- function(clin_results, fc, p_col,
 # ===========================================================================
 # Function: plot_mean_ci_stars
 # ===========================================================================
-plot_mean_ci_stars <- function(data, y_var, y_axis_title, 
-                               legend_position = c(0.6, 0.8), 
-                               baseline_visit = 0, 
+# line plot of mean +/- CI by treatment over visits with significance stars
+plot_mean_ci_stars <- function(data, y_var, y_axis_title,
+                               legend_position = c(0.6, 0.8),
+                               baseline_visit = 0,
                                visits_to_plot = c(-4, 0, 4, 16, 18),
                                covariates = NULL,
                                test_method = "lmer_covars") { # test method can be "lmer", "ancova", "lmer_covars"
@@ -2174,7 +2162,6 @@ plot_mean_ci_stars <- function(data, y_var, y_axis_title,
     ) %>%
     dplyr::mutate(y_position = max_upper + 0.05 * max_upper)
   
-  print(contrast_results)
   # --- Plot ---
   p <- data %>%
     ggplot(aes(x = factor(visit, levels = visits_to_plot), y = !!y_sym, color = treatment)) +
@@ -2216,6 +2203,8 @@ plot_mean_ci_stars <- function(data, y_var, y_axis_title,
 # Function: create_gene_expression_plots
 # ===========================================================================
 
+# create combined volcano + subtype dot plot panel for a cell type group
+# shows top DEGs in volcano and their subtype-level logFC as a dot plot
 create_gene_expression_plots <- function(main_results,
                                          subtype_results_list,
                                          cell_type_labels = NULL,
@@ -2585,10 +2574,7 @@ matrix_to_list <- function(pws){
 # ===========================================================================
 library(fgsea)
 prepare_gmt <- function(gmt_file, genes_in_data, savefile = FALSE){
-  # for debug
-  #file <- gmt_files[1]
-  #genes_in_data <- df$gene_symbol
-  
+
   # Read in gmt file
   gmt <- gmtPathways(gmt_file)
   hidden <- unique(unlist(gmt))
@@ -2610,7 +2596,6 @@ prepare_gmt <- function(gmt_file, genes_in_data, savefile = FALSE){
     saveRDS(final_list, file = paste0(gsub('.gmt', '', gmt_file), '_subset_', format(Sys.time(), '%d%m'), '.RData'))
   }
   
-  print('Wohoo! .gmt conversion successfull!:)')
   return(final_list)
 }
 
@@ -2848,7 +2833,7 @@ trt_run_cell_type_analysis <- function(cell_type,
                                        input_suffix,
                                        output_base_path,
                                        output_prefix,
-                                       bg_path = file.path(root_path, "GSEA/"),
+                                       bg_path = file.path(root_path, "GSEA"),
                                        bucket = "attempt",
                                        region = "") {
   
@@ -2913,7 +2898,7 @@ t1dhc_run_cell_type_analysis <- function(cell_type,
                                          input_suffix,
                                          output_base_path,
                                          output_prefix,
-                                         bg_path = file.path(root_path, "GSEA/"),
+                                         bg_path = file.path(root_path, "GSEA"),
                                          plot_title = "Volcano Plot",
                                          bucket = "attempt",
                                          region = "") {
@@ -3101,6 +3086,7 @@ t1dhc_run_cell_type_analysis <- function(cell_type,
 # Function: slingshot_setup
 # ===========================================================================
 
+# convert Seurat to SCE, run PCA, and create elbow plot for PC selection
 slingshot_setup <- function(seurat_obj, celltype_prefix) {
   library(SingleCellExperiment)
   library(slingshot)
@@ -3157,6 +3143,7 @@ slingshot_setup <- function(seurat_obj, celltype_prefix) {
 # Function: run_slingshot
 # ===========================================================================
 
+# run slingshot trajectory inference on top PCs with specified start/end clusters
 run_slingshot <- function(sce, pca_obj, n_pcs = 6, start_cluster = NULL, end_cluster = NULL, cluster_label = "celltype") {
   library(slingshot)
   library(uwot)
@@ -3189,9 +3176,10 @@ run_slingshot <- function(sce, pca_obj, n_pcs = 6, start_cluster = NULL, end_clu
 # Function: plot_slingshot_trajectory
 # ===========================================================================
 
-plot_slingshot_trajectory <- function(sce_sl, 
-                                      celltype_levels, 
-                                      custom_colors = color_5, 
+# plot UMAP colored by cell type with slingshot trajectory curve overlaid
+plot_slingshot_trajectory <- function(sce_sl,
+                                      celltype_levels,
+                                      custom_colors = color_5,
                                       cluster_label = "celltype",
                                       bucket = "attempt",
                                       celltype_suffix = NULL,
@@ -3391,7 +3379,6 @@ plot_and_test_pseudotime_distribution <- function(df,
   # Run progressionTest
   registerDoSEQ()
   test_result <- progressionTest(sce_object, conditions = df[[visit_treatment_var]])
-  print(test_result)
   return(list(plot = p, test_result = test_result))
 }
 
@@ -3506,6 +3493,7 @@ plot_delta_percentile_heatmap <- function(df,
 library(dplyr)
 library(ggplot2)
 
+# bin a clinical variable into direction groups and compute pseudotime density per group
 analyze_pseudotime_by_clinvar <- function(df,
                                           clinical_var,          # unquoted column name of clinical variable
                                           pseudotime_var,        # unquoted column name of pseudotime
@@ -3682,9 +3670,6 @@ analyze_pseudotime_by_clinvar <- function(df,
                             filesuffix, "_slingshot.png"))
     }
     
-    # Print both new plots
-    print(p_visit_direction)
-    print(p_visit_direction_faceted)
   }
   
   # Save original plot if bucket is specified
@@ -3695,8 +3680,6 @@ analyze_pseudotime_by_clinvar <- function(df,
                                              tolower(celltype_suffix), "_", clinical_var_chr, 
                                              filesuffix, "_slingshot.png"))
   }
-  
-  print(p_original)
   
   # Step 8: KS test between selected bin levels (original functionality)
   bin_levels <- levels(droplevels(df_binned$clinical_bin))
@@ -3710,7 +3693,6 @@ analyze_pseudotime_by_clinvar <- function(df,
       pull(!!pseudotime_var)
     
     ks <- ks.test(pt1, pt2)
-    print(ks)
   } else {
     warning("Not enough bins to compare the requested levels.")
     ks <- NULL
@@ -3730,8 +3712,6 @@ analyze_pseudotime_by_clinvar <- function(df,
         df_pre_pos %>% pull(!!pseudotime_var),
         df_pre_neg %>% pull(!!pseudotime_var)
       )
-      cat("\nKS test PRE/+ vs PRE/-:\n")
-      print(ks_pre)
     }
     
     # Compare POST/+ vs POST/-
@@ -3745,8 +3725,6 @@ analyze_pseudotime_by_clinvar <- function(df,
         df_post_pos %>% pull(!!pseudotime_var),
         df_post_neg %>% pull(!!pseudotime_var)
       )
-      cat("\nKS test POST/+ vs POST/-:\n")
-      print(ks_post)
     }
     
     # Compare across visits for same direction
@@ -3755,8 +3733,6 @@ analyze_pseudotime_by_clinvar <- function(df,
         df_pre_pos %>% pull(!!pseudotime_var),
         df_post_pos %>% pull(!!pseudotime_var)
       )
-      cat("\nKS test PRE/+ vs POST/+:\n")
-      print(ks_pos_visits)
     }
     
     ks_visit_direction <- list(
@@ -3783,14 +3759,17 @@ analyze_pseudotime_by_clinvar <- function(df,
 
 library(quantreg)
 library(slingshot)
-analyze_pseudotime_by_celltype <- function(so, 
-                                           celltype_col,    
-                                           celltype_groups, 
-                                           start_cluster,   
+# full slingshot pseudotime pipeline for a cell type group:
+# subsets Seurat object, runs PCA, slingshot trajectory, quantile regression vs clinical vars,
+# and generates UMAP trajectory plots, density plots, and violin plots per treatment/visit
+analyze_pseudotime_by_celltype <- function(so,
+                                           celltype_col,
+                                           celltype_groups,
+                                           start_cluster,
                                            celltype_levels = celltype_groups,
-                                           custom_colors,   
-                                           suffix, 
-                                           n_pcs = 10, 
+                                           custom_colors,
+                                           suffix,
+                                           n_pcs = 10,
                                            tau = c(0.25, 0.5, 0.75),
                                            aws_s3,
                                            s3_key) {
@@ -4302,6 +4281,7 @@ plot_clinvar_pseudotime_arrows_delta <- function(df,
 # Function: create_croc_attempt_df
 # ===========================================================================
 
+# merge ATTEMPT DiD and CROCODILE T1D vs HC results, classify genes as reversed or non-reversed
 create_croc_attempt_df <- function(attempt_df,
                                    croc_df,
                                    cell_type = "PT",
@@ -4355,6 +4335,7 @@ create_croc_attempt_df <- function(attempt_df,
 # Function: plot_croc_attempt_volcano
 # ===========================================================================
 
+# volcano plot of CROCODILE results with points colored by ATTEMPT DiD direction
 plot_croc_attempt_volcano <- function(attempt_df,
                                       croc_df,
                                       cell_type = "PT",
@@ -4515,6 +4496,7 @@ plot_croc_attempt_volcano <- function(attempt_df,
 # Function: soma_corr
 # ===========================================================================
 
+# compute Spearman correlations between SomaLogic protein deltas and clinical variable deltas
 soma_corr <- function(
     clinical_raw,          # raw clinical data (long format)
     soma_raw,              # raw soma data (long format)
@@ -4632,7 +4614,8 @@ soma_corr <- function(
 # Function: soma_plot_corr_volcano
 # ===========================================================================
 
-soma_plot_corr_volcano <- function (data, 
+# volcano plot for Spearman correlation results with optional DiD direction overlay
+soma_plot_corr_volcano <- function (data,
                                     FC = "FC",           # Column name as string
                                     p.value = "p.value", # Column name as string
                                     labels = "labels",   # Column name as string
@@ -4783,9 +4766,11 @@ library(tibble)
 library(tidyr)
 library(limma)
 
+# run limma differential expression on SomaLogic proteomics data
+# supports within_treatment, within_visit, interaction, and interaction_random model types
 run_limma_proteomics <- function(
-    data, 
-    analyte_info, 
+    data,
+    analyte_info,
     treatment = "Placebo",
     visit = "PRE",
     visit_var = "visit",
@@ -4989,7 +4974,9 @@ run_limma_proteomics <- function(
 # Function: run_fgsea_analysis
 # ===========================================================================
 
-run_fgsea_analysis <- function(bg_path = file.path(root_path, "GSEA/"),
+# run fGSEA across KEGG, Reactome, GO, Hallmark, and full combined gene set databases
+# ranks genes by stat_col and returns enrichment results for each database
+run_fgsea_analysis <- function(bg_path = file.path(root_path, "GSEA"),
                                results_annotated,
                                stat_col = "t",
                                gene_col = "EntrezGeneSymbol",
@@ -5170,7 +5157,7 @@ run_fgsea_analysis <- function(bg_path = file.path(root_path, "GSEA/"),
 # Function: process_enrichr_data
 # ===========================================================================
 
-# Function to process enrichr results
+# extract top significant Reactome pathways from EnrichR results and format for plotting
 process_enrichr_data <- function(enrichr_result, response_type, top_n = 20) {
   # Extract the Reactome 2022 results (or whichever database you used)
   data <- enrichr_result[["Reactome_Pathways_2024"]] # Adjust database name as needed
@@ -5207,7 +5194,7 @@ process_enrichr_data <- function(enrichr_result, response_type, top_n = 20) {
 # Function: prepare_pathway_data
 # ===========================================================================
 
-# Process enrichr results
+# process positive, negative, and discordant EnrichR pathway results together
 prepare_pathway_data <- function(negative_paths_df, positive_paths_df, discordant_paths_df) {
   # Process each dataset
   negative_paths <- process_enrichr_data(negative_paths_df, "Negative")
@@ -5233,7 +5220,8 @@ library(ggrepel)
 library(enrichR)
 library(stringr)
 
-# Main function to perform concordance analysis
+# compare protein and transcript DE directions, classify as concordant/discordant,
+# run EnrichR pathway analysis on each group, and generate volcano + pathway plots
 perform_concordance_analysis <- function(
     protein_data,             # The actual protein dataframe (not wrapped in results_annotated)
     transcript_data,          # Single-cell transcript data 
@@ -5637,14 +5625,13 @@ batch_concordance_analysis <- function(
 # Function: vertical_upset
 # ===========================================================================
 
-# install.packages(c("dplyr","tidyr","purrr","ggplot2","cowplot"))
-# install.packages(c("dplyr","tidyr","purrr","ggplot2","cowplot"))
 library(dplyr)
 library(tidyr)
 library(purrr)
 library(ggplot2)
 library(cowplot)
 
+# custom vertical upset plot showing intersection sizes across cell types
 vertical_upset <- function(df, sets, top_n = Inf, min_size = 1,
                            order_sets = sets,
                            bar_fill = "grey60",
@@ -5967,42 +5954,12 @@ vertical_upset <- function(df, sets, top_n = Inf, min_size = 1,
   return(final)
 }
 
-# Example usage with your data:
-# vertical_upset(
-#   upset_combined_dat,
-#   sets = c("PT", "TAL", "EC", "IC", "IMMUNE", "VSMC_P_FIB", "POD"),
-#   show_set_sizes = TRUE,
-#   connect_lines  = TRUE, 
-#   min_size = 3
-# )
-
-# Example with custom colors and multi-intersection highlighting:
-# my_colors <- c(
-#   "PT" = "#8B7D6B",
-#   "TAL" = "#6B8E9F", 
-#   "EC" = "#8FA68E",
-#   "IC" = "#B8A9C9",
-#   "IMMUNE" = "#D4A76A",
-#   "VSMC_P_FIB" = "#9B6B6B",
-#   "POD" = "#7A9A9F"
-# )
-# 
-# vertical_upset(
-#   upset_combined_dat,
-#   sets = c("PT", "TAL", "EC", "IC", "IMMUNE", "VSMC_P_FIB", "POD"),
-#   show_set_sizes = TRUE,
-#   connect_lines  = TRUE, 
-#   min_size = 3,
-#   set_colors = my_colors,
-#   multi_bar_fill = "#4A90A4",  # Color for 3+ intersections
-#   multi_threshold = 3          # Highlight bars with 3 or more cell types
-# )
-
 
 # ===========================================================================
 # Function: shorten_pathway_names
 # ===========================================================================
 
+# truncate and clean long pathway names for readable plot labels
 shorten_pathway_names <- function(pathway_names, max_length = 40, aggressive = FALSE) {
   
   # Define replacement patterns
@@ -6108,25 +6065,6 @@ shorten_pathway_names <- function(pathway_names, max_length = 40, aggressive = F
       result <- gsub(" \\([^)]+\\)", "", result)
     }
     
-    # # Step 5: If still too long, abbreviate remaining long words
-    # if (nchar(result) > max_length) {
-    #   words <- strsplit(result, " ")[[1]]
-    #   # Abbreviate words longer than 8 characters that aren't already abbreviated
-    #   words <- sapply(words, function(word) {
-    #     if (nchar(word) > 8 && !grepl("[A-Z]{2,}", word)) {
-    #       # Keep first 3-4 letters and last letter
-    #       if (nchar(word) > 10) {
-    #         paste0(substr(word, 1, 3), ".", substr(word, nchar(word), nchar(word)))
-    #       } else {
-    #         paste0(substr(word, 1, 4), ".")
-    #       }
-    #     } else {
-    #       word
-    #     }
-    #   })
-    #   result <- paste(words, collapse = " ")
-    # }
-    
     # Step 6: Final truncation if needed
     if (nchar(result) > max_length) {
       step6_truncated[i] <<- TRUE  # Mark this pathway as truncated at Step 6
@@ -6167,6 +6105,7 @@ get_legend <- function(myplot) {
 # Function: concordance_by_celltype
 # ===========================================================================
 
+# classify protein-transcript pairs as concordant/discordant/mixed per cell type
 concordance_by_celltype <- function(
     biofluid_df,
     scrna_df,
@@ -6258,7 +6197,6 @@ concordance_by_celltype <- function(
                         paste0(tolower(celltype), "_", biofluid_label, "_concordance.csv"))
   readr::write_csv(concordance_tbl, out_file)
   
-  print(table(concordance_tbl$concordance, useNA = "ifany"))
   message("Saved: ", out_file)
   
   return(concordance_tbl)
@@ -6388,8 +6326,9 @@ plot_gsea_results <- function(gsea_list,
 # Function: calculate_celltype_proportions
 # ===========================================================================
 
+# bin cells along pseudotime and compute cell type proportions within each bin
 calculate_celltype_proportions <- function(data, bin_width = 10, group_by = "KPMP_celltype") {
-  
+
   # Create pseudotime bins
   data_with_bins <- data %>%
     dplyr::mutate(
@@ -6433,8 +6372,7 @@ calculate_celltype_proportions <- function(data, bin_width = 10, group_by = "KPM
 # Function: create_pie_chart
 # ===========================================================================
 
-# Function to create a single pie chart for a given bin
-# Requires: library(dplyr); library(ggplot2); library(ggtext); library(tidyr); library(rlang)
+# create a pie chart of cell type proportions for a single pseudotime bin
 create_pie_chart <- function(data,
                              bin_value,
                              color_palette,
